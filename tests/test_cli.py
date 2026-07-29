@@ -2,6 +2,8 @@ import importlib
 import sys
 from pathlib import Path
 
+from fastapi import FastAPI
+
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
@@ -38,3 +40,35 @@ def test_serve_help_does_not_disclose_a_credential_value(capsys):
         assert exc.code == 0
 
     assert "credential" not in capsys.readouterr().out.lower()
+
+
+def test_main_passes_explicit_serve_address_to_uvicorn_without_disclosing_credentials(
+    monkeypatch, caplog, capsys
+):
+    """Dropping a serve override or logging a credential must fail this CLI boundary contract."""
+    cli = require_module("platform_integration.cli", "platform-integration serve CLI")
+    credential_sentinel = "credential-ref://cli-boundary-sentinel"
+    calls = []
+
+    def record_run(application, *, host, port):
+        calls.append((application, host, port))
+
+    monkeypatch.setenv("PLATFORM_INTEGRATION_PDM_CREDENTIAL_REF", credential_sentinel)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["platform-integration", "serve", "--host", "127.0.0.2", "--port", "9031"],
+    )
+    monkeypatch.setattr(cli.uvicorn, "run", record_run)
+
+    cli.main()
+
+    assert len(calls) == 1
+    application, host, port = calls[0]
+    assert isinstance(application, FastAPI)
+    assert host == "127.0.0.2"
+    assert port == 9031
+    captured = capsys.readouterr()
+    assert credential_sentinel not in captured.out
+    assert credential_sentinel not in captured.err
+    assert credential_sentinel not in caplog.text

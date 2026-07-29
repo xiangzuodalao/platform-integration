@@ -11,8 +11,11 @@ def test_build_context_excludes_local_secrets_and_cache_files():
     """Removing ignore rules or the non-root image contract must fail this build-context check."""
     env_sentinel = COMPONENT_ROOT / ".env.test-sentinel"
     cache_sentinel = COMPONENT_ROOT / ".pytest_cache" / "test-sentinel"
-    image_tag = f"platform-integration-hygiene-{uuid.uuid4().hex}"
-    container_name = f"platform-integration-hygiene-{uuid.uuid4().hex}"
+    identifier = uuid.uuid4().hex
+    production_image_tag = f"platform-integration-hygiene-{identifier}"
+    probe_image_tag = f"platform-integration-context-probe-{identifier}"
+    production_container_name = f"platform-integration-hygiene-{identifier}"
+    probe_container_name = f"platform-integration-context-probe-{identifier}"
 
     try:
         env_sentinel.write_text("must-not-enter-image", encoding="utf-8")
@@ -47,7 +50,7 @@ def test_build_context_excludes_local_secrets_and_cache_files():
         assert ".pytest_cache/test-sentinel" in ignored.stdout
 
         subprocess.run(
-            ["docker", "build", "--tag", image_tag, "."],
+            ["docker", "build", "--tag", production_image_tag, "."],
             cwd=COMPONENT_ROOT,
             check=True,
         )
@@ -56,7 +59,7 @@ def test_build_context_excludes_local_secrets_and_cache_files():
                 "docker",
                 "image",
                 "inspect",
-                image_tag,
+                production_image_tag,
                 "--format",
                 "{{json .Config.Cmd}} {{.Config.User}}",
             ],
@@ -81,10 +84,10 @@ def test_build_context_excludes_local_secrets_and_cache_files():
                 "run",
                 "--rm",
                 "--name",
-                container_name,
+                production_container_name,
                 "--entrypoint",
                 "sh",
-                image_tag,
+                production_image_tag,
                 "-c",
                 "test ! -e /app/.env.test-sentinel && test ! -e /app/.pytest_cache/test-sentinel "
                 "&& test -d /app/src && test -f /app/pyproject.toml && test -f /app/uv.lock "
@@ -95,12 +98,46 @@ def test_build_context_excludes_local_secrets_and_cache_files():
             text=True,
         ).stdout.splitlines()
         assert listing[-2:] == ["10001", "10001"]
-    finally:
+
         subprocess.run(
-            ["docker", "rm", "--force", container_name], check=False, capture_output=True
+            ["docker", "build", "--file", "-", "--tag", probe_image_tag, "."],
+            cwd=COMPONENT_ROOT,
+            input=("FROM ghcr.io/astral-sh/uv:0.11.30-python3.12-trixie-slim\nCOPY . /context\n"),
+            text=True,
+            check=True,
         )
         subprocess.run(
-            ["docker", "image", "rm", "--force", image_tag], check=False, capture_output=True
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--name",
+                probe_container_name,
+                "--entrypoint",
+                "sh",
+                probe_image_tag,
+                "-c",
+                "test ! -e /context/.env.test-sentinel "
+                "&& test ! -e /context/.pytest_cache/test-sentinel "
+                "&& test -d /context/src && test -f /context/pyproject.toml "
+                "&& test -f /context/uv.lock",
+            ],
+            check=True,
+        )
+    finally:
+        subprocess.run(
+            ["docker", "rm", "--force", production_container_name], check=False, capture_output=True
+        )
+        subprocess.run(
+            ["docker", "rm", "--force", probe_container_name], check=False, capture_output=True
+        )
+        subprocess.run(
+            ["docker", "image", "rm", "--force", production_image_tag],
+            check=False,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["docker", "image", "rm", "--force", probe_image_tag], check=False, capture_output=True
         )
         env_sentinel.unlink(missing_ok=True)
         cache_sentinel.unlink(missing_ok=True)

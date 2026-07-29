@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
@@ -32,8 +33,12 @@ def test_settings_rejects_unknown_constructor_fields():
     """Allowing unrecognised settings must fail this configuration contract."""
     config = require_module("platform_integration.config", "strict settings validation")
 
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError) as exc_info:
         config.Settings(unexpected_setting="not-allowed")
+
+    error = exc_info.value.errors()[0]
+    assert error["loc"] == ("unexpected_setting",)
+    assert error["type"] == "extra_forbidden"
 
 
 def test_settings_has_no_builtin_credential_when_external_reference_is_absent(monkeypatch):
