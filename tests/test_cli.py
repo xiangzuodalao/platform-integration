@@ -1,4 +1,5 @@
 import importlib
+import logging
 import sys
 from pathlib import Path
 
@@ -60,6 +61,7 @@ def test_main_passes_explicit_serve_address_to_uvicorn_without_disclosing_creden
         ["platform-integration", "serve", "--host", "127.0.0.2", "--port", "9031"],
     )
     monkeypatch.setattr(cli.uvicorn, "run", record_run)
+    caplog.set_level(logging.DEBUG)
 
     cli.main()
 
@@ -68,6 +70,7 @@ def test_main_passes_explicit_serve_address_to_uvicorn_without_disclosing_creden
     assert isinstance(application, FastAPI)
     assert host == "127.0.0.2"
     assert port == 9031
+    assert application.state.settings.pdm_credential_ref == credential_sentinel
     captured = capsys.readouterr()
     assert credential_sentinel not in captured.out
     assert credential_sentinel not in captured.err
