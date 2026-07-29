@@ -1,0 +1,38 @@
+[build-system]
+requires = ["uv_build>=0.11.30,<0.12.0"]
+build-backend = "uv_build"
+
+[project]
+name = "platform-integration"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "alembic>=1.17,<2",
+  "fastapi==0.125.0",
+  "httpx==0.28.1",
+  "psycopg[binary,pool]>=3.2,<4",
+  "pydantic==2.12.5",
+  "pydantic-settings>=2.11,<3",
+  "rfc8785==0.1.4",
+  "sqlalchemy>=2.0,<3",
+  "uvicorn==0.38.0",
+]
+
+[project.scripts]
+platform-integration = "platform_integration.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest==9.0.2",
+  "pytest-asyncio>=1.2,<2",
+  "ruff==0.14.9",
+  "testcontainers[postgres]>=4,<5",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
