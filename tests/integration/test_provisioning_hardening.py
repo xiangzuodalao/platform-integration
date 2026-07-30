@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from contextlib import suppress
 from copy import deepcopy
@@ -83,6 +84,61 @@ async def sql_service(database_url, *, now=lambda: NOW):
     cmms = FakeCmms()
     provisioning, _, _, _ = service(tb=tb, cmms=cmms, store=store, now=now)
     return provisioning, store, tb, cmms, sessions
+
+
+class ReadinessBarrierThingsBoard(FakeThingsBoard):
+    def __init__(self) -> None:
+        super().__init__()
+        self.pause_next_device_list = False
+        self.paused = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def list_devices(self):
+        if self.pause_next_device_list:
+            self.pause_next_device_list = False
+            self.paused.set()
+            await self.release.wait()
+        return await super().list_devices()
+
+
+@pytest.mark.asyncio
+async def test_full_service_loser_repreflights_after_tenant_lock_before_external_writes(
+    clean_postgres,
+) -> None:
+    """Moving persisted preflight before the tenant lock lets a stale loser write TB."""
+    sessions = create_async_sessionmaker(clean_postgres)
+    tb = ReadinessBarrierThingsBoard()
+    cmms = FakeCmms()
+    first_store = SqlProvisioningStore(sessions)
+    second_store = SqlProvisioningStore(sessions)
+    first_service, _, _, _ = service(tb=tb, cmms=cmms, store=first_store)
+    second_service, _, _, _ = service(tb=tb, cmms=cmms, store=second_store)
+    first = await first_service.build_plan(ISOLATED_TENANT_ID, ACTOR)
+    second = deepcopy(first)
+    second.targets[0].measurement_binding["risk_threshold"] = "6.00"
+    second.canonical["targets"][0]["measurement_binding"]["risk_threshold"] = "6.00"
+    second.plan_hash = canonical_plan_hash(second.canonical)
+    await second_store.save_plan(binding_snapshot(), second)
+
+    tb.pause_next_device_list = True
+    loser = asyncio.create_task(
+        second_service.apply(second.plan_hash, second.plan_hash, APPLY_ACTOR)
+    )
+    await tb.paused.wait()
+    try:
+        await first_service.apply(first.plan_hash, first.plan_hash, APPLY_ACTOR)
+        cmms_writes_after_winner = len(cmms.create_calls)
+        tb_writes_after_winner = len(tb.write_calls)
+    finally:
+        tb.release.set()
+
+    with pytest.raises(ProvisioningError) as caught:
+        await loser
+
+    assert len(cmms.create_calls) == cmms_writes_after_winner
+    assert len(tb.write_calls) == tb_writes_after_winner
+    assert caught.value.code == "PROVISIONING_PERSISTED_STATE_CONFLICT"
+    await sessions.kw["bind"].dispose()
 
 
 @pytest.mark.asyncio

@@ -320,7 +320,6 @@ class ProvisioningService:
             (target, _request_digest(target), _request_projection(target))
             for target in plan.targets
         )
-        persisted_asset_ids = await self._store.preflight_plan(plan, reservations)
 
         devices = await self._tb.list_devices()
         try:
@@ -349,6 +348,7 @@ class ProvisioningService:
         results: dict[str, dict[str, object]] = {}
         completed = False
         try:
+            persisted_asset_ids = await self._store.preflight_plan(plan, reservations)
             for target, request_digest, request_summary in reservations:
                 await self._apply_target(
                     plan,
