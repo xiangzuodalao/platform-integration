@@ -707,3 +707,218 @@ async def test_shadow_summary_service_queries_one_complete_twenty_mapping_slot(
         assert summary["status_counts"] == {"SUCCEEDED": 20}
     finally:
         await sessions.kw["bind"].dispose()
+
+
+@pytest.mark.parametrize(
+    ("case_index", "invalid_value", "expected_quality_code"),
+    [
+        (0, None, "DUPLICATE_RAW_RECORD"),
+        (1, "NaN", "NON_FINITE_VALUE"),
+    ],
+)
+async def test_pinned_retry_quality_failure_preserves_original_evidence(
+    database_url,
+    case_index,
+    invalid_value,
+    expected_quality_code,
+):
+    """A retry quality failure must not combine a pinned request with later evidence."""
+    from sqlalchemy import delete
+
+    from platform_integration.clients.pdm import PdmClientError
+    from platform_integration.db import create_async_sessionmaker
+    from platform_integration.models.prediction import PredictionRun, RiskEvaluationState
+    from platform_integration.repositories.prediction_runs import PredictionRunRepository
+    from platform_integration.services.data_quality import INTERVAL_MS, TelemetryPoint
+    from platform_integration.services.prediction_requests import PredictionRequestBuilder
+    from platform_integration.services.prediction_runs import ShadowExecutionStore
+    from platform_integration.workers.prediction import PredictionProcessor
+
+    sessions = create_async_sessionmaker(database_url)
+    slot = SLOT + timedelta(days=4, minutes=15 * case_index)
+    window_end = int(slot.timestamp() * 1000)
+    window_start = window_end - 66 * INTERVAL_MS
+    valid_points = [
+        TelemetryPoint(
+            timestamp=window_start + index * INTERVAL_MS,
+            value=f"{index % 10}.00",
+            unit="mm/s",
+        )
+        for index in range(66)
+    ]
+    if invalid_value is None:
+        invalid_points = [*valid_points, valid_points[0]]
+    else:
+        invalid_points = [
+            TelemetryPoint(point.timestamp, invalid_value, point.unit) if index == 0 else point
+            for index, point in enumerate(valid_points)
+        ]
+
+    class ThingsBoard:
+        def __init__(self):
+            self.responses = [valid_points, invalid_points]
+
+        async def historical_telemetry(self, *_args, **_kwargs):
+            return self.responses.pop(0)
+
+    class Pdm:
+        def __init__(self):
+            self.calls = 0
+
+        async def predict(self, _request):
+            self.calls += 1
+            raise PdmClientError("PDM_UNAVAILABLE")
+
+    class RecordingStore:
+        def __init__(self, delegate):
+            self.delegate = delegate
+            self.quality_codes = []
+
+        def __getattr__(self, name):
+            return getattr(self.delegate, name)
+
+        async def skip(self, claim, code, summary, now):
+            self.quality_codes.append(code)
+            await self.delegate.skip(claim, code, summary, now)
+
+    try:
+        await seed_binding(sessions)
+        async with sessions() as session, session.begin():
+            await session.execute(
+                delete(RiskEvaluationState).where(
+                    RiskEvaluationState.tenant_id == TENANT_ID,
+                    RiskEvaluationState.equipment_id == EQUIPMENT_ID,
+                    RiskEvaluationState.meas_code == "vibration_rms",
+                )
+            )
+            session.add(
+                RiskEvaluationState(
+                    tenant_id=TENANT_ID,
+                    equipment_id=EQUIPMENT_ID,
+                    meas_code="vibration_rms",
+                    policy_version="pilot-policy-v1",
+                    consecutive_risk_count=2,
+                    consecutive_healthy_count=1,
+                    internal_active=True,
+                    alarm_aggregate_version=0,
+                    version=1,
+                )
+            )
+            await PredictionRunRepository(session).create_slot(
+                tenant_id=TENANT_ID,
+                equipment_id=EQUIPMENT_ID,
+                meas_code="vibration_rms",
+                scheduled_at=slot,
+            )
+
+        store = ShadowExecutionStore(sessions=sessions, tenant_id=TENANT_ID)
+        recording_store = RecordingStore(store)
+        pdm = Pdm()
+        processor = PredictionProcessor(
+            store=recording_store,
+            thingsboard=ThingsBoard(),
+            pdm=pdm,
+            request_builder=PredictionRequestBuilder(),
+            risk_evaluator=SimpleNamespace(),
+            runtime_tb_credential_ref="TB_TEST_CREDENTIAL",
+            runtime_pdm_credential_ref="PDM_TEST_CREDENTIAL",
+            clock=lambda: slot + timedelta(minutes=1),
+        )
+
+        first = await store.claim_next("worker-quality-first", slot)
+        assert first is not None
+        await processor.process(first)
+        async with sessions() as session:
+            first_attempt = await session.get(PredictionRun, first.run_id)
+            assert first_attempt is not None
+            pinned_snapshot = (
+                first_attempt.request_digest,
+                first_attempt.model_profile_id,
+                first_attempt.model_info_id,
+                first_attempt.preprocessing_version,
+                first_attempt.policy_version,
+                dict(first_attempt.quality_summary),
+            )
+        assert first_attempt.status == "FAILED"
+        assert first_attempt.error_code == "PDM_UNAVAILABLE"
+
+        retry = await store.claim_next(
+            "worker-quality-retry",
+            slot + timedelta(minutes=1),
+        )
+        assert retry is not None
+        assert retry.run_id == first.run_id
+        await processor.process(retry)
+
+        async with sessions() as session:
+            final_run = await session.get(PredictionRun, first.run_id)
+            state = await session.get(
+                RiskEvaluationState,
+                (TENANT_ID, EQUIPMENT_ID, "vibration_rms"),
+            )
+        assert final_run is not None
+        assert state is not None
+        assert final_run.status == "FAILED"
+        assert final_run.error_code == "PREDICTION_REQUEST_DRIFT"
+        assert final_run.attempt == 3
+        assert (
+            final_run.request_digest,
+            final_run.model_profile_id,
+            final_run.model_info_id,
+            final_run.preprocessing_version,
+            final_run.policy_version,
+            final_run.quality_summary,
+        ) == pinned_snapshot
+        assert recording_store.quality_codes == [expected_quality_code]
+        assert state.last_prediction_run_id == final_run.run_id
+        assert state.consecutive_risk_count == 0
+        assert state.consecutive_healthy_count == 0
+        assert state.internal_active
+        assert pdm.calls == 1
+    finally:
+        await sessions.kw["bind"].dispose()
+
+
+async def test_unpinned_first_quality_failure_persists_skipped_summary(database_url):
+    """A first-attempt quality failure must retain its ordinary skipped evidence."""
+    from platform_integration.db import create_async_sessionmaker
+    from platform_integration.models.prediction import PredictionRun
+    from platform_integration.repositories.prediction_runs import PredictionRunRepository
+    from platform_integration.services.prediction_runs import ShadowExecutionStore
+
+    sessions = create_async_sessionmaker(database_url)
+    slot = SLOT + timedelta(days=4, minutes=30)
+    summary = {
+        "distinct_bucket_count": 59,
+        "missing_bucket_count": 7,
+        "raw_record_count": 59,
+    }
+    try:
+        await seed_binding(sessions)
+        async with sessions() as session, session.begin():
+            await PredictionRunRepository(session).create_slot(
+                tenant_id=TENANT_ID,
+                equipment_id=EQUIPMENT_ID,
+                meas_code="vibration_rms",
+                scheduled_at=slot,
+            )
+        store = ShadowExecutionStore(sessions=sessions, tenant_id=TENANT_ID)
+        claim = await store.claim_next("worker-first-quality", slot)
+        assert claim is not None
+
+        await store.skip(
+            claim,
+            "MISSING_RATIO_EXCEEDED",
+            summary,
+            slot + timedelta(minutes=1),
+        )
+
+        async with sessions() as session:
+            run = await session.get(PredictionRun, claim.run_id)
+        assert run is not None
+        assert run.status == "SKIPPED_DATA_QUALITY"
+        assert run.error_code == "MISSING_RATIO_EXCEEDED"
+        assert run.request_digest is None
+        assert run.quality_summary == summary
+    finally:
+        await sessions.kw["bind"].dispose()

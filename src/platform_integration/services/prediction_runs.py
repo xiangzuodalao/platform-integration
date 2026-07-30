@@ -330,13 +330,34 @@ class ShadowExecutionStore:
         now: datetime,
     ) -> None:
         async with self._sessions() as session, session.begin():
-            changed = await PredictionRunRepository(session).mark_skipped(
-                claim.run_id,
-                claim.lease_owner,
-                now,
-                code=code,
-                quality_summary=summary,
+            run = await session.scalar(
+                select(PredictionRun)
+                .where(
+                    PredictionRun.run_id == claim.run_id,
+                    PredictionRun.status == "RUNNING",
+                    PredictionRun.lease_owner == claim.lease_owner,
+                )
+                .with_for_update()
             )
+            if run is None:
+                raise RuntimeError("PREDICTION_LEASE_LOST")
+            repository = PredictionRunRepository(session)
+            if run.request_digest is None:
+                changed = await repository.mark_skipped(
+                    claim.run_id,
+                    claim.lease_owner,
+                    now,
+                    code=code,
+                    quality_summary=summary,
+                )
+            else:
+                changed = await repository.mark_failed(
+                    claim.run_id,
+                    claim.lease_owner,
+                    now,
+                    code="PREDICTION_REQUEST_DRIFT",
+                    retryable=False,
+                )
             if not changed:
                 raise RuntimeError("PREDICTION_LEASE_LOST")
             await self._reset_risk_counters(session, claim)
