@@ -145,6 +145,52 @@ async def test_alarm_baseline_uses_exact_filter_and_strict_count() -> None:
 
 
 @pytest.mark.asyncio
+async def test_historical_telemetry_uses_the_exact_half_open_bucket_query() -> None:
+    """Changing aggregation, ordering, or the inclusive provider end corrupts PDM input."""
+    captured: httpx.Request | None = None
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal captured
+        captured = request
+        return httpx.Response(
+            200,
+            json={"vibration": [{"ts": 1785283740000, "value": "4.00"}]},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://tb.invalid",
+    ) as http:
+        client = ThingsBoardClient(
+            http=http,
+            credentials=provider(),
+            tb_credential_ref="TB_TEST_CREDENTIAL",
+        )
+        points = await client.historical_telemetry(
+            DEVICE_ID,
+            telemetry_key="vibration",
+            unit="mm/s",
+            start_ms=1785283740000,
+            end_exclusive_ms=1785287700000,
+        )
+
+    assert captured is not None
+    assert captured.method == "GET"
+    assert captured.url.path == (f"/api/plugins/telemetry/DEVICE/{DEVICE_ID}/values/timeseries")
+    assert dict(captured.url.params) == {
+        "keys": "vibration",
+        "startTs": "1785283740000",
+        "endTs": "1785287699999",
+        "interval": "60000",
+        "agg": "AVG",
+        "orderBy": "ASC",
+    }
+    assert [(item.timestamp, item.value, item.unit) for item in points] == [
+        (1785283740000, "4.00", "mm/s")
+    ]
+
+
+@pytest.mark.asyncio
 async def test_attribute_timeout_is_unknown_and_wrong_kind_fails_before_io() -> None:
     """Blindly hiding an unknown write or accepting another credential kind risks duplication."""
     calls = 0

@@ -168,7 +168,10 @@ async def test_stale_run_reuses_the_same_row_through_attempt_three(database_url)
 
             now += timedelta(minutes=10)
             async with session_factory() as session, session.begin():
-                stale_ids = await PredictionRunRepository(session).reconcile_stale(now)
+                stale_ids = await PredictionRunRepository(session).reconcile_stale(
+                    now,
+                    tenant_id=TENANT_ID,
+                )
                 assert stale_ids == [run.run_id]
 
             async with session_factory() as session:
@@ -199,5 +202,114 @@ async def test_stale_run_reuses_the_same_row_through_attempt_three(database_url)
             )
         assert recreated.run_id == run.run_id
         assert count == 1
+    finally:
+        await session_factory.kw["bind"].dispose()
+
+
+async def test_claim_next_retries_failed_rows_only_before_attempt_three_and_slot_deadline(
+    database_url,
+):
+    """Claiming terminal or expired FAILED rows would cross the slot retry boundary."""
+    from platform_integration.db import create_async_sessionmaker
+    from platform_integration.models.prediction import PredictionRun
+    from platform_integration.repositories.prediction_runs import PredictionRunRepository
+
+    session_factory = create_async_sessionmaker(database_url)
+    tenant_id = UUID("40000000-0000-4000-8000-000000000050")
+    retryable = PredictionRun(
+        tenant_id=tenant_id,
+        equipment_id=UUID("50000000-0000-4000-8000-000000000050"),
+        meas_code="vibration_rms",
+        scheduled_at=SCHEDULED_AT,
+        status="FAILED",
+        attempt=2,
+        error_code="PDM_UNAVAILABLE",
+    )
+    exhausted = PredictionRun(
+        tenant_id=tenant_id,
+        equipment_id=UUID("50000000-0000-4000-8000-000000000051"),
+        meas_code="vibration_rms",
+        scheduled_at=SCHEDULED_AT,
+        status="FAILED",
+        attempt=3,
+        error_code="PDM_UNAVAILABLE",
+    )
+    expired = PredictionRun(
+        tenant_id=tenant_id,
+        equipment_id=UUID("50000000-0000-4000-8000-000000000052"),
+        meas_code="vibration_rms",
+        scheduled_at=SCHEDULED_AT - timedelta(minutes=15),
+        status="FAILED",
+        attempt=1,
+        error_code="PDM_UNAVAILABLE",
+    )
+    try:
+        async with session_factory() as session, session.begin():
+            session.add_all([retryable, exhausted, expired])
+
+        async with session_factory() as session, session.begin():
+            repository = PredictionRunRepository(session)
+            claimed = await repository.claim_next(
+                "worker-a",
+                SCHEDULED_AT + timedelta(minutes=1),
+                tenant_id=tenant_id,
+            )
+            assert claimed is not None
+            assert claimed.run_id == retryable.run_id
+            assert claimed.attempt == 3
+            assert not await repository.has_eligible(
+                SCHEDULED_AT + timedelta(minutes=1),
+                tenant_id=tenant_id,
+            )
+    finally:
+        await session_factory.kw["bind"].dispose()
+
+
+async def test_failure_transition_releases_lease_and_is_retryable_only_when_explicit(
+    database_url,
+):
+    """Leaving ownership on a failed row or retrying permanent errors can strand the queue."""
+    from platform_integration.db import create_async_sessionmaker
+    from platform_integration.models.prediction import PredictionRun
+    from platform_integration.repositories.prediction_runs import PredictionRunRepository
+
+    session_factory = create_async_sessionmaker(database_url)
+    tenant_id = UUID("40000000-0000-4000-8000-000000000060")
+    async with session_factory() as session, session.begin():
+        run = await PredictionRunRepository(session).create_slot(
+            tenant_id=tenant_id,
+            equipment_id=UUID("50000000-0000-4000-8000-000000000060"),
+            meas_code="vibration_rms",
+            scheduled_at=SCHEDULED_AT,
+        )
+    now = SCHEDULED_AT + timedelta(minutes=1)
+    try:
+        async with session_factory() as session, session.begin():
+            repository = PredictionRunRepository(session)
+            claimed = await repository.claim(run.run_id, "worker-a", now)
+            assert claimed is not None
+            await repository.mark_failed(
+                run.run_id,
+                "worker-a",
+                now,
+                code="PDM_UNAVAILABLE",
+                retryable=True,
+            )
+
+        async with session_factory() as session:
+            failed = await session.get(PredictionRun, run.run_id)
+            assert failed is not None
+            assert failed.status == "FAILED"
+            assert failed.lease_owner is None
+            assert failed.lease_expires_at is None
+
+        async with session_factory() as session, session.begin():
+            reclaimed = await PredictionRunRepository(session).claim_next(
+                "worker-b",
+                now,
+                tenant_id=tenant_id,
+            )
+            assert reclaimed is not None
+            assert reclaimed.run_id == run.run_id
     finally:
         await session_factory.kw["bind"].dispose()

@@ -6,6 +6,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     Integer,
@@ -124,6 +125,12 @@ class RiskEvaluationState(Base):
         nullable=False,
         default=0,
         server_default="0",
+    )
+    internal_active: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
     )
     last_prediction_run_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True))
     alert_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True))

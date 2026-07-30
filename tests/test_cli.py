@@ -175,3 +175,68 @@ def test_provisioning_receipt_output_includes_exact_apply_actor():
     )
 
     assert receipt["apply_actor_id"] == str(apply_actor)
+
+
+def test_shadow_role_parsers_expose_only_bounded_explicit_operations():
+    """Dropping --once or broadening summary selection would make pilot execution unbounded."""
+    cli = require_module("platform_integration.cli", "shadow execution CLI roles")
+    parser = cli.build_parser()
+
+    assert parser.parse_args(["migrate"]).command == "migrate"
+    discover = parser.parse_args(["discover-identities", "--format", "env"])
+    assert (discover.command, discover.format) == ("discover-identities", "env")
+    scheduler = parser.parse_args(["scheduler", "--once", "--now", "2026-07-30T06:00:00Z"])
+    assert scheduler.once and scheduler.now == "2026-07-30T06:00:00Z"
+    assert parser.parse_args(["prediction-worker", "--once"]).once
+    summary = parser.parse_args(
+        [
+            "shadow-summary",
+            "--tenant-alias",
+            "ifactory-pilot",
+            "--scheduled-at",
+            "2026-07-30T06:00:00Z",
+            "--format",
+            "json",
+        ]
+    )
+    assert (summary.tenant_alias, summary.format) == ("ifactory-pilot", "json")
+
+
+def test_scheduler_now_requires_once_and_explicit_isolated_pilot_mode(monkeypatch, capsys):
+    """Allowing clock injection in production could backfill or overwrite a real slot."""
+    cli = require_module("platform_integration.cli", "isolated scheduler clock gate")
+    calls = []
+    monkeypatch.delenv("PLATFORM_INTEGRATION_ISOLATED_PILOT_MODE", raising=False)
+    monkeypatch.setattr(cli, "run_scheduler", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["platform-integration", "scheduler", "--once", "--now", "2026-07-30T06:00:00Z"],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+
+    assert exc_info.value.code == 2
+    assert calls == []
+    assert capsys.readouterr().err == "error: ISOLATED_PILOT_MODE_REQUIRED\n"
+
+
+def test_migrate_failure_is_nonzero_and_redacted(monkeypatch, capsys):
+    """Alembic failures must not disclose the database URL or migration traceback."""
+    cli = require_module("platform_integration.cli", "safe migrate role")
+    secret = "postgresql://user:sensitive@private-db/integration"
+
+    def fail():
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(cli, "run_migrate", fail)
+    monkeypatch.setattr(sys, "argv", ["platform-integration", "migrate"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+
+    captured = capsys.readouterr()
+    assert exc_info.value.code == 2
+    assert captured.err == "error: SHADOW_COMMAND_FAILED\n"
+    assert secret not in captured.out + captured.err

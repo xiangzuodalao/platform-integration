@@ -10,6 +10,15 @@ from platform_integration.commands.provision import (
     run_provision_plan,
     run_provision_verify,
 )
+from platform_integration.commands.shadow import (
+    parse_rfc3339,
+    run_discover_identities,
+    run_migrate,
+    run_prediction_worker,
+    run_scheduler,
+    run_shadow_summary,
+)
+from platform_integration.config import Settings
 
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -40,6 +49,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify.add_argument("--tenant-alias", required=True)
     verify.add_argument("--plan-hash", required=True, type=_sha256)
+    commands.add_parser("migrate", help="upgrade the integration database to head")
+    discover = commands.add_parser("discover-identities", help="read canonical provider IDs")
+    discover.add_argument("--format", choices=("env",), required=True)
+    scheduler = commands.add_parser("scheduler", help="create prediction slot rows")
+    scheduler.add_argument("--once", action="store_true")
+    scheduler.add_argument("--now")
+    worker = commands.add_parser("prediction-worker", help="process eligible prediction rows")
+    worker.add_argument("--once", action="store_true")
+    summary = commands.add_parser("shadow-summary", help="print bounded shadow evidence")
+    summary.add_argument("--tenant-alias", required=True)
+    summary.add_argument("--scheduled-at", required=True)
+    summary.add_argument("--format", choices=("json",), required=True)
     return parser
 
 
@@ -60,12 +81,33 @@ def main() -> None:
             )
         elif arguments.command == "provision-verify":
             run_provision_verify(arguments.tenant_alias, arguments.plan_hash)
+        elif arguments.command == "migrate":
+            run_migrate()
+        elif arguments.command == "discover-identities":
+            run_discover_identities()
+        elif arguments.command == "scheduler":
+            now = None if arguments.now is None else parse_rfc3339(arguments.now)
+            if now is not None and (
+                not arguments.once or Settings().isolated_pilot_mode is not True
+            ):
+                from platform_integration.commands.shadow import ShadowCommandError
+
+                raise ShadowCommandError("ISOLATED_PILOT_MODE_REQUIRED")
+            run_scheduler(once=arguments.once, now=now)
+        elif arguments.command == "prediction-worker":
+            run_prediction_worker(once=arguments.once)
+        elif arguments.command == "shadow-summary":
+            run_shadow_summary(
+                arguments.tenant_alias,
+                parse_rfc3339(arguments.scheduled_at),
+            )
     except Exception as exc:
         candidate = getattr(exc, "code", None)
-        code = (
-            candidate
-            if type(candidate) is str and re.fullmatch(r"[A-Z][A-Z0-9_]{2,99}", candidate)
-            else "PROVISIONING_COMMAND_FAILED"
-        )
+        if type(candidate) is str and re.fullmatch(r"[A-Z][A-Z0-9_]{2,99}", candidate):
+            code = candidate
+        elif arguments.command.startswith("provision-"):
+            code = "PROVISIONING_COMMAND_FAILED"
+        else:
+            code = "SHADOW_COMMAND_FAILED"
         print(f"error: {code}", file=sys.stderr)
         raise SystemExit(2) from None

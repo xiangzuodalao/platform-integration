@@ -131,6 +131,9 @@ def test_shadow_schema_uses_contract_types_and_bounded_summaries(postgres_url):
         threshold = columns[("measurement_binding", "risk_threshold")]
         assert threshold["data_type"] == "numeric"
         assert (threshold["numeric_precision"], threshold["numeric_scale"]) == (20, 6)
+        internal_active = columns[("risk_evaluation_state", "internal_active")]
+        assert internal_active["data_type"] == "boolean"
+        assert internal_active["is_nullable"] == "NO"
 
         jsonb_columns = {key for key, column in columns.items() if column["udt_name"] == "jsonb"}
         assert jsonb_columns == {
@@ -309,5 +312,30 @@ def test_shadow_migration_is_reversible_using_only_the_testcontainer_url(postgre
                 ).scalar_one()
                 == apply_actor
             )
+    finally:
+        engine.dispose()
+
+
+def test_internal_risk_state_migration_round_trip(postgres_url):
+    """A one-way active-state column would make rollback of the isolated pilot unsafe."""
+    config = _alembic_config(postgres_url)
+    command.upgrade(config, "head")
+    command.downgrade(config, "0002_provisioning_apply_actor")
+    engine = create_engine(postgres_url)
+    try:
+        assert "internal_active" not in {
+            column["name"] for column in inspect(engine).get_columns("risk_evaluation_state")
+        }
+    finally:
+        engine.dispose()
+
+    command.upgrade(config, "head")
+    engine = create_engine(postgres_url)
+    try:
+        columns = {
+            column["name"]: column
+            for column in inspect(engine).get_columns("risk_evaluation_state")
+        }
+        assert not columns["internal_active"]["nullable"]
     finally:
         engine.dispose()

@@ -12,6 +12,7 @@ from platform_integration.credentials import (
     CredentialResolutionError,
     EnvironmentCredentialProvider,
 )
+from platform_integration.services.data_quality import TelemetryPoint
 
 
 THINGSBOARD_TIMEOUT_SECONDS = 10.0
@@ -211,6 +212,52 @@ class ThingsBoardClient:
             return count
         except ValueError:
             raise ThingsBoardClientError("THINGSBOARD_INVALID_ALARM_RESPONSE") from None
+
+    async def historical_telemetry(
+        self,
+        device_id: UUID | str,
+        *,
+        telemetry_key: str,
+        unit: str,
+        start_ms: int,
+        end_exclusive_ms: int,
+    ) -> tuple[TelemetryPoint, ...]:
+        canonical_id = str(_canonical_uuid(device_id))
+        if (
+            type(start_ms) is not int
+            or type(end_exclusive_ms) is not int
+            or end_exclusive_ms <= start_ms
+        ):
+            raise ThingsBoardClientError("THINGSBOARD_INVALID_TELEMETRY_WINDOW")
+        response = await self._request(
+            "GET",
+            f"/api/plugins/telemetry/DEVICE/{canonical_id}/values/timeseries",
+            params={
+                "keys": telemetry_key,
+                "startTs": start_ms,
+                "endTs": end_exclusive_ms - 1,
+                "interval": 60000,
+                "agg": "AVG",
+                "orderBy": "ASC",
+            },
+        )
+        try:
+            payload = response.json()
+            if type(payload) is not dict or set(payload) != {telemetry_key}:
+                raise ValueError("exact telemetry response required")
+            rows = payload[telemetry_key]
+            if type(rows) is not list:
+                raise ValueError("telemetry rows required")
+            points: list[TelemetryPoint] = []
+            for row in rows:
+                if type(row) is not dict or set(row) != {"ts", "value"}:
+                    raise ValueError("strict telemetry row required")
+                if type(row["ts"]) is not int or type(row["value"]) is not str:
+                    raise ValueError("strict telemetry scalar required")
+                points.append(TelemetryPoint(row["ts"], row["value"], unit))
+            return tuple(points)
+        except ValueError:
+            raise ThingsBoardClientError("THINGSBOARD_INVALID_TELEMETRY_RESPONSE") from None
 
     async def write_asset_attributes(
         self,
