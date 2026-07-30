@@ -48,7 +48,7 @@ def test_main_passes_explicit_serve_address_to_uvicorn_without_disclosing_creden
 ):
     """Dropping a serve override or logging a credential must fail this CLI boundary contract."""
     cli = require_module("platform_integration.cli", "platform-integration serve CLI")
-    credential_sentinel = "credential-ref://cli-boundary-sentinel"
+    credential_sentinel = "PDM_CLI_BOUNDARY_SENTINEL"
     calls = []
 
     def record_run(application, *, host, port):

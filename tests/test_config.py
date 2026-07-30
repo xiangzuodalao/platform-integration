@@ -24,9 +24,9 @@ def require_module(name: str, behaviour: str):
 def test_settings_reads_the_prefixed_external_credential_reference(monkeypatch):
     """Breaking the PLATFORM_INTEGRATION_ prefix must fail this configuration contract."""
     config = require_module("platform_integration.config", "prefixed credential reference settings")
-    monkeypatch.setenv("PLATFORM_INTEGRATION_PDM_CREDENTIAL_REF", "secret-manager://pdm/pilot")
+    monkeypatch.setenv("PLATFORM_INTEGRATION_PDM_CREDENTIAL_REF", "PDM_PILOT_CREDENTIAL")
 
-    assert config.Settings().pdm_credential_ref == "secret-manager://pdm/pilot"
+    assert config.Settings().pdm_credential_ref == "PDM_PILOT_CREDENTIAL"
 
 
 def test_settings_rejects_unknown_constructor_fields():
@@ -49,3 +49,33 @@ def test_settings_has_no_builtin_credential_when_external_reference_is_absent(mo
     monkeypatch.delenv("PLATFORM_INTEGRATION_PDM_CREDENTIAL_REF", raising=False)
 
     assert config.Settings().pdm_credential_ref is None
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "AB",
+        "pdm_pilot_credential",
+        "1PDM_PILOT_CREDENTIAL",
+        "PDM-PILOT-CREDENTIAL",
+        "${PDM_PILOT_CREDENTIAL}",
+        "A" * 129,
+    ],
+)
+def test_settings_rejects_non_environment_variable_references(monkeypatch, invalid: str):
+    """Accepting indirect or ambiguous references would weaken direct environment lookup."""
+    config = require_module("platform_integration.config", "credential reference validation")
+    monkeypatch.setenv("PLATFORM_INTEGRATION_PDM_CREDENTIAL_REF", invalid)
+
+    with pytest.raises(ValidationError):
+        config.Settings()
+
+
+@pytest.mark.parametrize("length", [3, 128])
+def test_settings_accepts_credential_reference_length_boundaries(monkeypatch, length: int):
+    """Rejecting a frozen regex boundary would make valid deployment references unusable."""
+    config = require_module("platform_integration.config", "credential reference boundaries")
+    reference = "A" * length
+    monkeypatch.setenv("PLATFORM_INTEGRATION_PDM_CREDENTIAL_REF", reference)
+
+    assert config.Settings().pdm_credential_ref == reference
