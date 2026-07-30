@@ -193,6 +193,7 @@ class ShadowExecutionStore:
                     code="PREDICTION_BINDING_INACTIVE",
                     retryable=False,
                 )
+                await self._reset_risk_counters_for_run(session, run)
             measurement, equipment, tenant = joined
             binding = PredictionTarget(
                 tenant_id=measurement.tenant_id,
@@ -426,13 +427,58 @@ class ShadowExecutionStore:
         )
 
     async def _reset_risk_counters(self, session, claim) -> None:
-        state = await self._locked_state(session, claim)
         run = await session.get(PredictionRun, claim.run_id)
-        if run is None or not await self._is_newest_run(session, state, run):
+        if run is None:
+            return
+        await self._reset_risk_counters_for_run(
+            session,
+            run,
+            policy_version=claim.binding.policy_version,
+        )
+
+    async def _reset_risk_counters_for_run(
+        self,
+        session,
+        run: PredictionRun,
+        *,
+        policy_version: str | None = None,
+    ) -> None:
+        if policy_version is not None:
+            await session.execute(
+                insert(RiskEvaluationState)
+                .values(
+                    tenant_id=run.tenant_id,
+                    equipment_id=run.equipment_id,
+                    meas_code=run.meas_code,
+                    policy_version=policy_version,
+                    consecutive_risk_count=0,
+                    consecutive_healthy_count=0,
+                    internal_active=False,
+                    alarm_aggregate_version=0,
+                    version=0,
+                )
+                .on_conflict_do_nothing(
+                    index_elements=[
+                        RiskEvaluationState.tenant_id,
+                        RiskEvaluationState.equipment_id,
+                        RiskEvaluationState.meas_code,
+                    ]
+                )
+            )
+        state = await session.scalar(
+            select(RiskEvaluationState)
+            .where(
+                RiskEvaluationState.tenant_id == run.tenant_id,
+                RiskEvaluationState.equipment_id == run.equipment_id,
+                RiskEvaluationState.meas_code == run.meas_code,
+            )
+            .with_for_update()
+        )
+        if state is None or not await self._is_newest_run(session, state, run):
             return
         state.consecutive_risk_count = 0
         state.consecutive_healthy_count = 0
-        state.last_prediction_run_id = claim.run_id
+        state.last_prediction_run_id = run.run_id
         state.version += 1
 
     @staticmethod

@@ -187,7 +187,7 @@ async def test_success_persists_only_summary_and_updates_risk_in_the_same_transa
 async def test_inactive_binding_is_terminalized_without_hiding_the_next_eligible_run(database_url):
     """Returning None after one bad binding makes --once leave valid work stranded."""
     from platform_integration.db import create_async_sessionmaker
-    from platform_integration.models.prediction import PredictionRun
+    from platform_integration.models.prediction import PredictionRun, RiskEvaluationState
     from platform_integration.repositories.prediction_runs import PredictionRunRepository
     from platform_integration.services.prediction_runs import ShadowExecutionStore
 
@@ -203,6 +203,19 @@ async def test_inactive_binding_is_terminalized_without_hiding_the_next_eligible
                 equipment_id=invalid_equipment,
                 meas_code="vibration_rms",
                 scheduled_at=invalid_slot,
+            )
+            session.add(
+                RiskEvaluationState(
+                    tenant_id=TENANT_ID,
+                    equipment_id=invalid_equipment,
+                    meas_code="vibration_rms",
+                    policy_version="pilot-policy-v1",
+                    consecutive_risk_count=2,
+                    consecutive_healthy_count=1,
+                    internal_active=True,
+                    alarm_aggregate_version=0,
+                    version=1,
+                )
             )
             valid = await PredictionRunRepository(session).create_slot(
                 tenant_id=TENANT_ID,
@@ -223,10 +236,19 @@ async def test_inactive_binding_is_terminalized_without_hiding_the_next_eligible
                     PredictionRun.scheduled_at == invalid_slot,
                 )
             )
+            state = await session.get(
+                RiskEvaluationState,
+                (TENANT_ID, invalid_equipment, "vibration_rms"),
+            )
         assert invalid is not None
+        assert state is not None
         assert invalid.status == "FAILED"
         assert invalid.attempt == 3
         assert invalid.error_code == "PREDICTION_BINDING_INACTIVE"
+        assert state.last_prediction_run_id == invalid.run_id
+        assert state.consecutive_risk_count == 0
+        assert state.consecutive_healthy_count == 0
+        assert state.internal_active
     finally:
         await sessions.kw["bind"].dispose()
 
