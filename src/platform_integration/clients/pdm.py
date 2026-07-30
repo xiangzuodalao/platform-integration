@@ -89,6 +89,9 @@ class PdmClient:
             credential_unavailable = True
         if credential_unavailable:
             raise PdmClientError("PDM_CREDENTIAL_UNAVAILABLE") from None
+        if credential.kind != "opaque_bearer":
+            del credential
+            raise PdmClientError("PDM_CREDENTIAL_KIND_INVALID") from None
         token = credential.value.get_secret_value()
         timed_out = False
         network_failed = False

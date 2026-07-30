@@ -134,6 +134,42 @@ async def test_predict_sends_exact_json_bearer_and_ten_second_timeout(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_predict_rejects_non_opaque_credential_kind_before_io(monkeypatch) -> None:
+    """Accepting a TB or CMMS envelope would cross credential trust boundaries."""
+    clients = require_module("platform_integration.clients.pdm", "strict PDM credential kind")
+    credentials = require_module(
+        "platform_integration.credentials", "environment credential resolution"
+    )
+    calls = 0
+    secret = "wrong-kind-sensitive-canary"
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json=response_payload())
+
+    monkeypatch.setenv(
+        CREDENTIAL_REF,
+        json.dumps({"kind": "thingsboard_bearer", "value": secret}),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://pdm.invalid",
+    ) as http:
+        client = clients.PdmClient(
+            http=http,
+            credentials=credentials.EnvironmentCredentialProvider(),
+            pdm_credential_ref=CREDENTIAL_REF,
+        )
+        with pytest.raises(clients.PdmClientError) as exc_info:
+            await client.predict(prediction_request())
+
+    assert exc_info.value.code == "PDM_CREDENTIAL_KIND_INVALID"
+    assert calls == 0
+    assert secret not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
 async def test_predict_timeout_is_safe_and_never_retried(monkeypatch, caplog, capfd) -> None:
     """Retrying a timeout or exposing its authorized request could duplicate work or leak a token."""
     clients = require_module("platform_integration.clients.pdm", "safe PDM timeout mapping")

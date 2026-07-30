@@ -51,6 +51,27 @@ def test_settings_has_no_builtin_credential_when_external_reference_is_absent(mo
     assert config.Settings().pdm_credential_ref is None
 
 
+def test_isolated_provisioning_settings_are_external_and_exact():
+    """Implicit tenant identities or endpoints could direct writes outside the isolated pilot."""
+    config = require_module("platform_integration.config", "isolated provisioning settings")
+    settings = config.Settings(
+        tenant_alias="ifactory-pilot",
+        tenant_id="00000000-0000-4000-8000-000000000001",
+        isolated_pilot_mode=True,
+        tb_base_url="https://tb.invalid",
+        cmms_base_url="https://cmms.invalid",
+        tb_tenant_id="00000000-0000-4000-8000-000000000001",
+        cmms_company_id=201,
+        tb_credential_ref="TB_PILOT_CREDENTIAL",
+        cmms_credential_ref="CMMS_PILOT_CREDENTIAL",
+    )
+
+    assert str(settings.tenant_id) == "00000000-0000-4000-8000-000000000001"
+    assert settings.isolated_pilot_mode is True
+    assert str(settings.tb_base_url) == "https://tb.invalid/"
+    assert str(settings.cmms_base_url) == "https://cmms.invalid/"
+
+
 @pytest.mark.parametrize(
     "invalid",
     [

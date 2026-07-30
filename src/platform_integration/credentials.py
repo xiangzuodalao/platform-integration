@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import re
-from typing import Annotated, Literal
+from typing import Annotated, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
@@ -25,8 +26,27 @@ class OpaqueBearerCredential(BaseModel):
     value: SecretStr = Field(min_length=1)
 
 
+class ThingsBoardBearerCredential(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    kind: Literal["thingsboard_bearer"]
+    value: SecretStr = Field(min_length=1)
+
+
+class CmmsApiKeyCredential(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    kind: Literal["cmms_api_key"]
+    value: SecretStr = Field(min_length=1)
+
+
+CredentialEnvelope: TypeAlias = (
+    OpaqueBearerCredential | ThingsBoardBearerCredential | CmmsApiKeyCredential
+)
+
+
 class EnvironmentCredentialProvider:
-    def get(self, reference: str) -> OpaqueBearerCredential:
+    def get(self, reference: str) -> CredentialEnvelope:
         if type(reference) is not str or CREDENTIAL_REFERENCE_RE.fullmatch(reference) is None:
             raise CredentialResolutionError("CREDENTIAL_REFERENCE_INVALID") from None
         envelope = os.environ.get(reference)
@@ -34,7 +54,21 @@ class EnvironmentCredentialProvider:
             raise CredentialResolutionError("CREDENTIAL_NOT_FOUND") from None
         invalid_envelope = False
         try:
-            result = OpaqueBearerCredential.model_validate_json(envelope)
+            # Dispatch only on the exact kind token; each concrete model then
+            # enforces strict types and rejects extra envelope fields.
+            decoded = json.loads(envelope)
+            if type(decoded) is not dict:
+                raise ValueError("object envelope required")
+            kind = decoded.get("kind")
+            model = {
+                "opaque_bearer": OpaqueBearerCredential,
+                "thingsboard_bearer": ThingsBoardBearerCredential,
+                "cmms_api_key": CmmsApiKeyCredential,
+            }.get(kind)
+            if model is None:
+                raise ValueError("unsupported credential kind")
+            result = model.model_validate(decoded)
+            del decoded, kind, model
         except (ValidationError, ValueError):
             invalid_envelope = True
         if invalid_envelope:

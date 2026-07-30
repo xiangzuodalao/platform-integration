@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import importlib
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
+from pydantic import SecretStr
 
 
 EQUIPMENT_ID = "00000000-0000-4000-8000-000000000101"
 IDEMPOTENCY_KEY = "pilot-asset:00000000-0000-4000-8000-000000000201"
+CMMS_CREDENTIAL_REF = "CMMS_TEST_CREDENTIAL"
 
 
 def require_module(name: str, behaviour: str):
@@ -28,6 +31,17 @@ def asset_create():
     return contracts.CmmsAssetCreate(
         name="Pilot CNC",
         equipment_id=EQUIPMENT_ID.upper(),
+    )
+
+
+def cmms_client(clients, http: httpx.AsyncClient, provider=None):
+    provider = provider or SimpleNamespace(
+        get=lambda _: SimpleNamespace(kind="cmms_api_key", value=SecretStr("cmms-secret"))
+    )
+    return clients.CmmsClient(
+        http=http,
+        credentials=provider,
+        cmms_credential_ref=CMMS_CREDENTIAL_REF,
     )
 
 
@@ -57,7 +71,7 @@ async def test_caller_can_get_before_post_with_exact_idempotent_request() -> Non
         transport=httpx.MockTransport(handler),
         base_url="https://cmms.invalid",
     ) as http:
-        client = clients.CmmsClient(http=http)
+        client = cmms_client(clients, http)
         existing = await client.find_asset_by_equipment_id(EQUIPMENT_ID.upper())
         result = existing or await client.create_asset(
             asset_create(),
@@ -111,7 +125,7 @@ async def test_find_returns_projected_asset_or_none() -> None:
         transport=httpx.MockTransport(handler),
         base_url="https://cmms.invalid",
     ) as http:
-        client = clients.CmmsClient(http=http)
+        client = cmms_client(clients, http)
         assert await client.find_asset_by_equipment_id(EQUIPMENT_ID) is None
         asset = await client.find_asset_by_equipment_id(EQUIPMENT_ID)
 
@@ -140,7 +154,7 @@ async def test_create_same_body_replay_preserves_exact_header_and_payload() -> N
         transport=httpx.MockTransport(handler),
         base_url="https://cmms.invalid",
     ) as http:
-        client = clients.CmmsClient(http=http)
+        client = cmms_client(clients, http)
         first = await client.create_asset(asset_create(), idempotency_key=IDEMPOTENCY_KEY)
         replay = await client.create_asset(asset_create(), idempotency_key=IDEMPOTENCY_KEY)
 
@@ -169,7 +183,7 @@ async def test_create_maps_idempotency_conflict() -> None:
         ),
         base_url="https://cmms.invalid",
     ) as http:
-        client = clients.CmmsClient(http=http)
+        client = cmms_client(clients, http)
         with pytest.raises(clients.CmmsClientError) as exc_info:
             await client.create_asset(asset_create(), idempotency_key=IDEMPOTENCY_KEY)
 
@@ -197,7 +211,7 @@ async def test_post_timeout_is_unknown_without_retry_or_hidden_get() -> None:
         transport=httpx.MockTransport(handler),
         base_url="https://cmms.invalid",
     ) as http:
-        client = clients.CmmsClient(http=http)
+        client = cmms_client(clients, http)
         with pytest.raises(clients.CmmsClientError) as exc_info:
             await client.create_asset(asset_create(), idempotency_key=IDEMPOTENCY_KEY)
         reconciled = await client.find_asset_by_equipment_id(EQUIPMENT_ID)
@@ -234,8 +248,100 @@ async def test_create_rejects_noncanonical_pilot_idempotency_keys(invalid: str) 
         transport=httpx.MockTransport(handler),
         base_url="https://cmms.invalid",
     ) as http:
-        client = clients.CmmsClient(http=http)
+        client = cmms_client(clients, http)
         with pytest.raises(clients.CmmsClientError, match="IDEMPOTENCY_KEY_INVALID"):
             await client.create_asset(asset_create(), idempotency_key=invalid)
 
     assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_cmms_uses_rotated_api_key_per_call_and_strict_identity_endpoints() -> None:
+    """Caching credentials or using the wrong auth/search contract would break safe rotation."""
+    clients = require_module("platform_integration.clients.cmms", "credential-bound CMMS client")
+    secrets = iter(("first-secret", "second-secret"))
+    provider = SimpleNamespace(
+        get=lambda _: SimpleNamespace(kind="cmms_api_key", value=SecretStr(next(secrets)))
+    )
+    seen: list[tuple[str, str, str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        seen.append((request.method, request.url.path, request.headers["x-api-key"], body))
+        if request.url.path == "/api/auth/me":
+            return httpx.Response(
+                200,
+                json={"companyId": 201, "username": "pilot-operator"},
+            )
+        return httpx.Response(200, json={"totalElements": 0})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://cmms.invalid",
+    ) as http:
+        client = cmms_client(clients, http, provider)
+        assert await client.authenticated_company_id() == 201
+        assert await client.total_work_orders() == 0
+
+    assert seen == [
+        ("GET", "/api/auth/me", "first-secret", None),
+        (
+            "POST",
+            "/api/work-orders/search",
+            "second-secret",
+            {
+                "filterFields": [],
+                "direction": "ASC",
+                "pageNum": 0,
+                "pageSize": 1,
+                "sortField": "id",
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cmms_wrong_credential_kind_fails_before_io_without_secret_disclosure() -> None:
+    """Accepting a bearer token as a CMMS key would cross credential trust boundaries."""
+    clients = require_module("platform_integration.clients.cmms", "strict CMMS credentials")
+    calls = 0
+    secret = "must-never-leak"
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500)
+
+    provider = SimpleNamespace(
+        get=lambda _: SimpleNamespace(kind="opaque_bearer", value=SecretStr(secret))
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://cmms.invalid",
+    ) as http:
+        client = cmms_client(clients, http, provider)
+        with pytest.raises(clients.CmmsClientError) as exc_info:
+            await client.authenticated_company_id()
+
+    assert exc_info.value.code == "CMMS_CREDENTIAL_KIND_INVALID"
+    assert calls == 0
+    assert secret not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_cmms_missing_company_identity_maps_to_stable_safe_error() -> None:
+    """Leaking a provider-shape KeyError would break the strict identity boundary."""
+    clients = require_module("platform_integration.clients.cmms", "CMMS identity validation")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, json={"username": "pilot-operator"})
+        ),
+        base_url="https://cmms.invalid",
+    ) as http:
+        client = cmms_client(clients, http)
+        with pytest.raises(clients.CmmsClientError) as exc_info:
+            await client.authenticated_company_id()
+
+    assert exc_info.value.code == "CMMS_INVALID_IDENTITY_RESPONSE"
+    assert exc_info.value.__cause__ is None

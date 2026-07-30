@@ -30,6 +30,45 @@ def test_serve_parser_defaults_to_8080_and_accepts_a_port_override():
     assert parser.parse_args(["serve", "--port", "9010"]).port == 9010
 
 
+def test_provisioning_parsers_require_explicit_confirmation_and_exact_receipt_key():
+    """Making confirmation optional or verify broad would weaken the two-turn safety gate."""
+    cli = require_module("platform_integration.cli", "provisioning CLI")
+    parser = cli.build_parser()
+
+    plan = parser.parse_args(
+        ["provision-plan", "--tenant-alias", "ifactory-pilot", "--actor", "operator"]
+    )
+    assert (plan.command, plan.tenant_alias, plan.actor) == (
+        "provision-plan",
+        "ifactory-pilot",
+        "operator",
+    )
+    apply = parser.parse_args(
+        [
+            "provision-apply",
+            "--tenant-alias",
+            "ifactory-pilot",
+            "--plan-hash",
+            "a" * 64,
+            "--confirmed-hash",
+            "a" * 64,
+            "--actor",
+            "operator",
+        ]
+    )
+    assert apply.plan_hash == apply.confirmed_hash == "a" * 64
+    verify = parser.parse_args(
+        [
+            "provision-verify",
+            "--tenant-alias",
+            "ifactory-pilot",
+            "--plan-hash",
+            "a" * 64,
+        ]
+    )
+    assert (verify.command, verify.plan_hash) == ("provision-verify", "a" * 64)
+
+
 def test_serve_help_does_not_disclose_a_credential_value(capsys):
     """Adding credential material to public CLI help must fail this safety contract."""
     cli = require_module("platform_integration.cli", "platform-integration serve CLI")
