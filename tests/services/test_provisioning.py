@@ -24,6 +24,7 @@ from platform_integration.services.tenant_bindings import (
 
 NOW = datetime(2026, 7, 30, 6, 0, tzinfo=UTC)
 ACTOR = UUID("00000000-0000-4000-8000-000000000099")
+APPLY_ACTOR = UUID("00000000-0000-4000-8000-000000000098")
 
 
 def devices() -> list[ThingsBoardDevice]:
@@ -109,6 +110,7 @@ class FakeStore:
 
     async def preflight_plan(self, plan, reservations):
         self.events.append(("preflight", plan.plan_hash))
+        persisted_assets = {}
         for target, request_digest, request_summary in reservations:
             existing = self.reservations.get(target.tb_device_id)
             proposed = (target.equipment_id, request_digest, request_summary)
@@ -117,6 +119,7 @@ class FakeStore:
             binding = self.bindings.get(target.tb_device_id)
             if binding is not None and binding != target.measurement_binding:
                 raise ProvisioningError("MEASUREMENT_BINDING_CONFLICT")
+        return persisted_assets
 
     async def reserve_target(self, plan, target, request_digest, request_summary):
         self.events.append(("reserve", target.tb_device_id, request_digest, request_summary))
@@ -126,8 +129,8 @@ class FakeStore:
             raise ProvisioningError("EQUIPMENT_RESERVATION_CONFLICT")
         self.reservations[target.tb_device_id] = current
 
-    async def activate_target(self, plan, target, cmms_asset_id, measurement):
-        self.events.append(("activate", target.tb_device_id, cmms_asset_id, measurement))
+    async def activate_target(self, plan, target, cmms_asset_id, measurement, actor):
+        self.events.append(("activate", target.tb_device_id, cmms_asset_id, measurement, actor))
         key = target.tb_device_id
         previous = self.bindings.get(key)
         if previous is not None and previous != measurement:
@@ -137,6 +140,7 @@ class FakeStore:
     async def finish_apply(self, plan, actor, results, now):
         self.events.append(("finish", plan.plan_hash, actor, results, now))
         plan.applied_at = now
+        plan.apply_actor = actor
         plan.terminal_result = "ACTIVE"
         plan.target_results = results
 
@@ -288,3 +292,15 @@ async def test_verify_reads_exact_tenant_hash_receipt_and_requires_all_twenty_ta
         await provisioning.verify(ISOLATED_TENANT_ID, plan.plan_hash)
     with pytest.raises(ProvisioningError, match="PROVISIONING_RECEIPT_NOT_FOUND"):
         await provisioning.verify(UUID(int=2), plan.plan_hash)
+
+
+@pytest.mark.asyncio
+async def test_receipt_distinguishes_build_actor_from_confirming_apply_actor() -> None:
+    """Returning only the plan builder would lose the identity that confirmed external writes."""
+    provisioning, _, _, _ = service()
+    plan = await provisioning.build_plan(ISOLATED_TENANT_ID, ACTOR)
+
+    result = await provisioning.apply(plan.plan_hash, plan.plan_hash, APPLY_ACTOR)
+
+    assert result.actor == ACTOR
+    assert result.apply_actor == APPLY_ACTOR

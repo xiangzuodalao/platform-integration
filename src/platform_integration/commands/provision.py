@@ -120,6 +120,7 @@ def _receipt(plan: ProvisioningPlan) -> dict[str, object]:
         "tenant_id": str(plan.tenant_id),
         "plan_hash": plan.plan_hash,
         "applied_at": None if plan.applied_at is None else plan.applied_at.isoformat(),
+        "apply_actor_id": None if plan.apply_actor is None else str(plan.apply_actor),
         "terminal_result": plan.terminal_result,
         "target_results": plan.target_results,
     }

@@ -174,6 +174,10 @@ class ProvisioningPlan(Base):
             "expires_at = created_at + INTERVAL '30 minutes'",
             name="ck_provisioning_plan_expiry",
         ),
+        CheckConstraint(
+            "terminal_result IS DISTINCT FROM 'ACTIVE' OR apply_actor_id IS NOT NULL",
+            name="ck_provisioning_plan_apply_actor",
+        ),
     )
 
     plan_id: Mapped[UUID] = mapped_column(
@@ -188,6 +192,7 @@ class ProvisioningPlan(Base):
     tb_tenant_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
     cmms_company_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     actor_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    apply_actor_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

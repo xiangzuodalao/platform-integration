@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from contextlib import suppress
 from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid5
 
 from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
 
 from platform_integration.models.audit import AuditEvent
 from platform_integration.models.bindings import (
@@ -18,6 +19,7 @@ from platform_integration.services.provisioning import (
     ProvisioningError,
     ProvisioningPlan,
     ProvisioningTarget,
+    canonical_plan_hash,
 )
 from platform_integration.services.tenant_bindings import ValidatedTenantBinding
 
@@ -44,6 +46,7 @@ def _plan_from_row(row: ProvisioningPlanRow) -> ProvisioningPlan:
         actor=row.actor_id,
         created_at=row.created_at,
         expires_at=row.expires_at,
+        apply_actor=row.apply_actor_id,
         applied_at=row.applied_at,
         target_results=row.target_results,
         terminal_result=row.terminal_result,
@@ -77,10 +80,16 @@ def _measurement_from_row(row: MeasurementBinding) -> dict[str, object]:
 class SqlProvisioningStore:
     def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
         self._sessions = sessions
-        self._apply_sessions: dict[tuple[UUID, str], AsyncSession] = {}
+        self._apply_connections: dict[UUID, AsyncConnection] = {}
 
     async def save_plan(self, snapshot: ValidatedTenantBinding, plan: ProvisioningPlan) -> None:
         async with self._sessions() as session, session.begin():
+            tenant_available = await session.scalar(
+                text("SELECT pg_try_advisory_xact_lock(hashtext(:tenant_id))"),
+                {"tenant_id": str(plan.tenant_id)},
+            )
+            if tenant_available is not True:
+                raise ProvisioningError("PROVISIONING_APPLY_CONCURRENT")
             existing = await session.get(TenantBinding, snapshot.tenant_id)
             identity = (
                 snapshot.alias,
@@ -119,13 +128,35 @@ class SqlProvisioningStore:
                     raise ProvisioningError("TENANT_BINDING_CONFLICT")
                 existing.enabled = True
             duplicate = await session.scalar(
-                select(ProvisioningPlanRow.plan_id).where(
+                select(ProvisioningPlanRow)
+                .where(
                     ProvisioningPlanRow.tenant_id == plan.tenant_id,
                     ProvisioningPlanRow.plan_hash == plan.plan_hash,
                 )
+                .with_for_update()
             )
             if duplicate is not None:
-                raise ProvisioningError("PROVISIONING_PLAN_ALREADY_EXISTS")
+                canonical_matches = (
+                    canonical_plan_hash(duplicate.canonical_plan) == duplicate.plan_hash
+                    and duplicate.canonical_plan == plan.canonical
+                    and duplicate.tenant_snapshot == plan.tenant_snapshot
+                    and duplicate.tb_tenant_id == snapshot.tb_tenant_id
+                    and duplicate.cmms_company_id == snapshot.cmms_company_id
+                )
+                renewable = (
+                    duplicate.applied_at is None
+                    and duplicate.apply_actor_id is None
+                    and duplicate.terminal_result is None
+                    and duplicate.expires_at <= plan.created_at
+                    and canonical_matches
+                )
+                if not renewable:
+                    raise ProvisioningError("PROVISIONING_PLAN_ALREADY_EXISTS")
+                duplicate.actor_id = plan.actor
+                duplicate.created_at = plan.created_at
+                duplicate.expires_at = plan.expires_at
+                duplicate.target_results = None
+                return
             session.add(
                 ProvisioningPlanRow(
                     tenant_id=plan.tenant_id,
@@ -135,6 +166,7 @@ class SqlProvisioningStore:
                     tb_tenant_id=snapshot.tb_tenant_id,
                     cmms_company_id=snapshot.cmms_company_id,
                     actor_id=plan.actor,
+                    apply_actor_id=None,
                     created_at=plan.created_at,
                     expires_at=plan.expires_at,
                 )
@@ -151,71 +183,113 @@ class SqlProvisioningStore:
         self,
         plan: ProvisioningPlan,
         reservations: tuple[tuple[ProvisioningTarget, str, dict[str, object]], ...],
-    ) -> None:
+    ) -> dict[UUID, int | None]:
         async with self._sessions() as session:
-            for target, digest, summary in reservations:
-                mapping = await session.scalar(
-                    select(EquipmentMapping).where(
-                        EquipmentMapping.tenant_id == plan.tenant_id,
-                        EquipmentMapping.tb_device_id == target.tb_device_id,
-                    )
+            mappings = (
+                await session.scalars(
+                    select(EquipmentMapping).where(EquipmentMapping.tenant_id == plan.tenant_id)
                 )
-                if mapping is not None and (
-                    mapping.equipment_id != target.equipment_id
-                    or mapping.cmms_request_digest != digest
-                    or mapping.cmms_request_summary != summary
-                ):
-                    raise ProvisioningError("EQUIPMENT_RESERVATION_CONFLICT")
-                binding = await session.scalar(
-                    select(MeasurementBinding).where(
-                        MeasurementBinding.tenant_id == plan.tenant_id,
-                        MeasurementBinding.equipment_id == target.equipment_id,
-                        MeasurementBinding.meas_code == target.measurement_binding["meas_code"],
-                    )
+            ).all()
+            bindings = (
+                await session.scalars(
+                    select(MeasurementBinding).where(MeasurementBinding.tenant_id == plan.tenant_id)
                 )
-                if binding is not None and _measurement_from_row(binding) != _persisted_measurement(
-                    target.measurement_binding
-                ):
-                    raise ProvisioningError("MEASUREMENT_BINDING_CONFLICT")
+            ).all()
+
+        expected = {
+            target.tb_device_id: (target, digest, summary)
+            for target, digest, summary in reservations
+        }
+        expected_equipment = {target.equipment_id: target for target, _, _ in reservations}
+        persisted_asset_ids: dict[UUID, int | None] = {}
+        mapping_by_equipment: dict[UUID, EquipmentMapping] = {}
+        for mapping in mappings:
+            item = expected.get(mapping.tb_device_id)
+            if item is None:
+                raise ProvisioningError("PROVISIONING_PERSISTED_STATE_CONFLICT")
+            target, digest, summary = item
+            common_matches = (
+                mapping.equipment_id == target.equipment_id
+                and mapping.cmms_request_digest == digest
+                and mapping.cmms_request_summary == summary
+                and mapping.enabled is True
+            )
+            state_matches = (mapping.status == "RESERVED" and mapping.cmms_asset_id is None) or (
+                mapping.status == "ACTIVE"
+                and type(mapping.cmms_asset_id) is int
+                and mapping.cmms_asset_id > 0
+            )
+            if not common_matches or not state_matches:
+                raise ProvisioningError("PROVISIONING_PERSISTED_STATE_CONFLICT")
+            mapping_by_equipment[mapping.equipment_id] = mapping
+            persisted_asset_ids[mapping.tb_device_id] = mapping.cmms_asset_id
+
+        binding_counts: dict[UUID, int] = {}
+        for binding in bindings:
+            target = expected_equipment.get(binding.equipment_id)
+            mapping = mapping_by_equipment.get(binding.equipment_id)
+            if (
+                target is None
+                or mapping is None
+                or mapping.status != "ACTIVE"
+                or _measurement_from_row(binding)
+                != _persisted_measurement(target.measurement_binding)
+            ):
+                raise ProvisioningError("PROVISIONING_PERSISTED_STATE_CONFLICT")
+            binding_counts[binding.equipment_id] = binding_counts.get(binding.equipment_id, 0) + 1
+        for equipment_id, mapping in mapping_by_equipment.items():
+            expected_count = 1 if mapping.status == "ACTIVE" else 0
+            if binding_counts.get(equipment_id, 0) != expected_count:
+                raise ProvisioningError("PROVISIONING_PERSISTED_STATE_CONFLICT")
+        return persisted_asset_ids
 
     async def start_apply(self, plan: ProvisioningPlan, actor: UUID, now: Any) -> None:
-        key = (plan.tenant_id, plan.plan_hash)
-        if key in self._apply_sessions:
+        tenant_id = plan.tenant_id
+        if tenant_id in self._apply_connections:
             raise ProvisioningError("PROVISIONING_APPLY_CONCURRENT")
-        session = self._sessions()
-        acquired = await session.scalar(
-            text("SELECT pg_try_advisory_lock(hashtext(:tenant_id), hashtext(:plan_hash))"),
-            {
-                "tenant_id": str(plan.tenant_id),
-                "plan_hash": plan.plan_hash,
-            },
-        )
-        await session.commit()
-        if acquired is not True:
-            await session.close()
-            raise ProvisioningError("PROVISIONING_APPLY_CONCURRENT")
-        row = await session.scalar(
-            select(ProvisioningPlanRow).where(
-                ProvisioningPlanRow.tenant_id == plan.tenant_id,
-                ProvisioningPlanRow.plan_hash == plan.plan_hash,
+        engine = self._sessions.kw["bind"]
+        connection = await engine.connect()
+        lock_acquired = False
+        try:
+            acquired = await connection.scalar(
+                text("SELECT pg_try_advisory_lock(hashtext(:tenant_id))"),
+                {"tenant_id": str(tenant_id)},
             )
-        )
-        await session.commit()
-        if (
-            row is None
-            or row.applied_at is not None
-            or row.terminal_result is not None
-            or now >= row.expires_at
-        ):
-            await self._unlock_and_close(key, session)
-            raise ProvisioningError("PROVISIONING_PLAN_NOT_APPLICABLE")
-        self._apply_sessions[key] = session
+            await connection.commit()
+            if acquired is not True:
+                raise ProvisioningError("PROVISIONING_APPLY_CONCURRENT")
+            lock_acquired = True
+            session = AsyncSession(bind=connection, expire_on_commit=False)
+            try:
+                row = await session.scalar(
+                    select(ProvisioningPlanRow).where(
+                        ProvisioningPlanRow.tenant_id == tenant_id,
+                        ProvisioningPlanRow.plan_hash == plan.plan_hash,
+                    )
+                )
+                await session.commit()
+            finally:
+                await session.close()
+            if (
+                row is None
+                or row.applied_at is not None
+                or row.terminal_result is not None
+                or now >= row.expires_at
+            ):
+                raise ProvisioningError("PROVISIONING_PLAN_NOT_APPLICABLE")
+        except BaseException:
+            if lock_acquired:
+                await self._unlock_and_close(tenant_id, connection)
+            else:
+                with suppress(Exception):
+                    await connection.close()
+            raise
+        self._apply_connections[tenant_id] = connection
 
     async def abort_apply(self, plan: ProvisioningPlan) -> None:
-        key = (plan.tenant_id, plan.plan_hash)
-        session = self._apply_sessions.pop(key, None)
-        if session is not None:
-            await self._unlock_and_close(key, session)
+        connection = self._apply_connections.pop(plan.tenant_id, None)
+        if connection is not None:
+            await self._unlock_and_close(plan.tenant_id, connection)
 
     async def reserve_target(
         self,
@@ -259,6 +333,7 @@ class SqlProvisioningStore:
         target: ProvisioningTarget,
         cmms_asset_id: int,
         measurement: dict[str, object],
+        actor: UUID,
     ) -> None:
         values = _persisted_measurement(measurement)
         async with self._sessions() as session, session.begin():
@@ -300,7 +375,7 @@ class SqlProvisioningStore:
             session.add(
                 AuditEvent(
                     tenant_id=plan.tenant_id,
-                    actor_id=plan.actor,
+                    actor_id=actor,
                     action="PILOT_TARGET_PROVISIONED",
                     target_type="TB_DEVICE",
                     target_id=str(target.tb_device_id),
@@ -320,10 +395,11 @@ class SqlProvisioningStore:
         results: dict[str, dict[str, object]],
         now: Any,
     ) -> None:
-        key = (plan.tenant_id, plan.plan_hash)
-        session = self._apply_sessions.get(key)
-        if session is None:
+        tenant_id = plan.tenant_id
+        connection = self._apply_connections.get(tenant_id)
+        if connection is None:
             raise ProvisioningError("PROVISIONING_APPLY_NOT_STARTED")
+        session = AsyncSession(bind=connection, expire_on_commit=False)
         try:
             async with session.begin():
                 row = await session.scalar(
@@ -337,6 +413,7 @@ class SqlProvisioningStore:
                 if row is None or row.applied_at is not None:
                     raise ProvisioningError("PROVISIONING_PLAN_NOT_APPLICABLE")
                 row.applied_at = now
+                row.apply_actor_id = actor
                 row.target_results = results
                 row.terminal_result = "ACTIVE"
                 session.add(
@@ -355,11 +432,13 @@ class SqlProvisioningStore:
                     )
                 )
             plan.applied_at = now
+            plan.apply_actor = actor
             plan.target_results = results
             plan.terminal_result = "ACTIVE"
         finally:
-            self._apply_sessions.pop(key, None)
-            await self._unlock_and_close(key, session)
+            await session.close()
+            self._apply_connections.pop(tenant_id, None)
+            await self._unlock_and_close(tenant_id, connection)
 
     async def read_receipt(self, tenant_id: UUID, plan_hash: str) -> ProvisioningPlan | None:
         async with self._sessions() as session:
@@ -373,12 +452,14 @@ class SqlProvisioningStore:
             return None if row is None else _plan_from_row(row)
 
     @staticmethod
-    async def _unlock_and_close(key: tuple[UUID, str], session: AsyncSession) -> None:
+    async def _unlock_and_close(tenant_id: UUID, connection: AsyncConnection) -> None:
         try:
-            await session.execute(
-                text("SELECT pg_advisory_unlock(hashtext(:tenant_id), hashtext(:plan_hash))"),
-                {"tenant_id": str(key[0]), "plan_hash": key[1]},
-            )
-            await session.commit()
+            with suppress(Exception):
+                await connection.rollback()
+                await connection.execute(
+                    text("SELECT pg_advisory_unlock(hashtext(:tenant_id))"),
+                    {"tenant_id": str(tenant_id)},
+                )
+                await connection.commit()
         finally:
-            await session.close()
+            await connection.close()

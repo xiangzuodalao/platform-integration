@@ -345,3 +345,26 @@ async def test_cmms_missing_company_identity_maps_to_stable_safe_error() -> None
 
     assert exc_info.value.code == "CMMS_INVALID_IDENTITY_RESPONSE"
     assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+async def test_cmms_rejects_company_identity_above_signed_bigint() -> None:
+    """Passing an oversized identity onward would fail only after local persistence began."""
+    clients = require_module("platform_integration.clients.cmms", "CMMS BIGINT identity guard")
+    calls = 0
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"companyId": 9_223_372_036_854_775_808})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://cmms.invalid",
+    ) as http:
+        client = cmms_client(clients, http)
+        with pytest.raises(clients.CmmsClientError) as exc_info:
+            await client.authenticated_company_id()
+
+    assert exc_info.value.code == "CMMS_INVALID_IDENTITY_RESPONSE"
+    assert calls == 1

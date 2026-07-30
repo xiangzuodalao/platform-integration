@@ -14,7 +14,14 @@ from platform_integration.clients.thingsboard import ThingsBoardClientError
 from platform_integration.db import create_async_sessionmaker
 from platform_integration.services.provisioning import ProvisioningError
 
-from tests.services.test_provisioning import ACTOR, FakeCmms, FakeStore, FakeThingsBoard, service
+from tests.services.test_provisioning import (
+    ACTOR,
+    APPLY_ACTOR,
+    FakeCmms,
+    FakeStore,
+    FakeThingsBoard,
+    service,
+)
 from platform_integration.services.tenant_bindings import ISOLATED_TENANT_ID
 
 
@@ -153,10 +160,12 @@ async def test_sql_store_persists_secret_free_complete_receipt_across_instances(
 
         replacement_store = SqlProvisioningStore(sessions)
         replacement, _, _, _ = service(tb=tb, cmms=cmms, store=replacement_store)
-        await replacement.apply(plan.plan_hash, plan.plan_hash, ACTOR)
+        await replacement.apply(plan.plan_hash, plan.plan_hash, APPLY_ACTOR)
         receipt = await replacement.verify(ISOLATED_TENANT_ID, plan.plan_hash)
 
         assert receipt.terminal_result == "ACTIVE"
+        assert receipt.actor == ACTOR
+        assert receipt.apply_actor == APPLY_ACTOR
         assert receipt.target_results is not None
         assert len(receipt.target_results) == 20
         engine = create_engine(database_url)

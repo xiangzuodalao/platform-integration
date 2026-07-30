@@ -19,6 +19,7 @@ from platform_integration.credentials import (
 
 
 CMMS_TIMEOUT_SECONDS = 10.0
+SIGNED_BIGINT_MAX = 9_223_372_036_854_775_807
 IDEMPOTENCY_KEY_RE = re.compile(
     r"^pilot-asset:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -111,7 +112,7 @@ class CmmsClient:
             if type(payload) is not dict:
                 raise ValueError("strict identity response required")
             company_id = payload["companyId"]
-            if type(company_id) is not int or company_id <= 0:
+            if type(company_id) is not int or company_id <= 0 or company_id > SIGNED_BIGINT_MAX:
                 raise ValueError("positive bigint required")
             return company_id
         except (KeyError, ValueError):

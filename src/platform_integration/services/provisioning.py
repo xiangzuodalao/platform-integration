@@ -148,6 +148,7 @@ class ProvisioningPlan:
     actor: UUID
     created_at: datetime
     expires_at: datetime
+    apply_actor: UUID | None = None
     applied_at: datetime | None = None
     target_results: dict[str, dict[str, object]] | None = None
     terminal_result: str | None = None
@@ -165,7 +166,7 @@ class ProvisioningStore(Protocol):
         self,
         plan: ProvisioningPlan,
         reservations: Sequence[tuple[ProvisioningTarget, str, dict[str, object]]],
-    ) -> None: ...
+    ) -> dict[UUID, int | None]: ...
 
     async def start_apply(self, plan: ProvisioningPlan, actor: UUID, now: datetime) -> None: ...
 
@@ -185,6 +186,7 @@ class ProvisioningStore(Protocol):
         target: ProvisioningTarget,
         cmms_asset_id: int,
         measurement: dict[str, object],
+        actor: UUID,
     ) -> None: ...
 
     async def finish_apply(
@@ -318,7 +320,7 @@ class ProvisioningService:
             (target, _request_digest(target), _request_projection(target))
             for target in plan.targets
         )
-        await self._store.preflight_plan(plan, reservations)
+        persisted_asset_ids = await self._store.preflight_plan(plan, reservations)
 
         devices = await self._tb.list_devices()
         try:
@@ -353,6 +355,8 @@ class ProvisioningService:
                     target,
                     request_digest,
                     request_summary,
+                    persisted_asset_ids.get(target.tb_device_id),
+                    actor,
                     results,
                 )
             completed_at = self._now()
@@ -369,10 +373,16 @@ class ProvisioningService:
         target: ProvisioningTarget,
         request_digest: str,
         request_summary: dict[str, object],
+        persisted_cmms_asset_id: int | None,
+        actor: UUID,
         results: dict[str, dict[str, object]],
     ) -> None:
         await self._store.reserve_target(plan, target, request_digest, request_summary)
         asset = await self._cmms.find_asset_by_equipment_id(target.equipment_id)
+        if persisted_cmms_asset_id is not None and (
+            asset is None or asset.id != persisted_cmms_asset_id
+        ):
+            raise ProvisioningError("CMMS_ASSET_CONFLICT")
         if asset is None:
             request = CmmsAssetCreate(
                 name=target.asset_name,
@@ -421,6 +431,7 @@ class ProvisioningService:
             target,
             asset.id,
             target.measurement_binding,
+            actor,
         )
         results[str(target.tb_device_id)] = {
             "tb_device_id": str(target.tb_device_id),

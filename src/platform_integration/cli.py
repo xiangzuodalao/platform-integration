@@ -1,5 +1,6 @@
 import argparse
 import re
+import sys
 
 import uvicorn
 
@@ -46,14 +47,25 @@ def main() -> None:
     arguments = build_parser().parse_args()
     if arguments.command == "serve":
         uvicorn.run(create_app(), host=arguments.host, port=arguments.port)
-    elif arguments.command == "provision-plan":
-        run_provision_plan(arguments.tenant_alias, arguments.actor)
-    elif arguments.command == "provision-apply":
-        run_provision_apply(
-            arguments.tenant_alias,
-            arguments.plan_hash,
-            arguments.confirmed_hash,
-            arguments.actor,
+        return
+    try:
+        if arguments.command == "provision-plan":
+            run_provision_plan(arguments.tenant_alias, arguments.actor)
+        elif arguments.command == "provision-apply":
+            run_provision_apply(
+                arguments.tenant_alias,
+                arguments.plan_hash,
+                arguments.confirmed_hash,
+                arguments.actor,
+            )
+        elif arguments.command == "provision-verify":
+            run_provision_verify(arguments.tenant_alias, arguments.plan_hash)
+    except Exception as exc:
+        candidate = getattr(exc, "code", None)
+        code = (
+            candidate
+            if type(candidate) is str and re.fullmatch(r"[A-Z][A-Z0-9_]{2,99}", candidate)
+            else "PROVISIONING_COMMAND_FAILED"
         )
-    elif arguments.command == "provision-verify":
-        run_provision_verify(arguments.tenant_alias, arguments.plan_hash)
+        print(f"error: {code}", file=sys.stderr)
+        raise SystemExit(2) from None

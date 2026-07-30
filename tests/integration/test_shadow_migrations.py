@@ -107,6 +107,7 @@ def test_shadow_schema_uses_contract_types_and_bounded_summaries(postgres_url):
             ("prediction_run", "run_id"),
             ("prediction_run", "correlation_id"),
             ("audit_event", "actor_id"),
+            ("provisioning_plan", "apply_actor_id"),
         ):
             assert columns[(table_name, column_name)]["udt_name"] == "uuid"
 
@@ -170,6 +171,7 @@ def test_shadow_schema_uses_contract_types_and_bounded_summaries(postgres_url):
                 "ck_provisioning_plan_snapshot_size",
                 "ck_provisioning_plan_results_size",
                 "ck_provisioning_plan_expiry",
+                "ck_provisioning_plan_apply_actor",
             },
             "prediction_run": {
                 "ck_prediction_run_status",
@@ -233,7 +235,7 @@ def test_provisioning_receipt_expires_exactly_thirty_minutes_after_creation(post
 
 
 def test_shadow_migration_is_reversible_using_only_the_testcontainer_url(postgres_url, monkeypatch):
-    """A downgrade that leaves owned tables behind or cannot re-upgrade breaks safe rollout."""
+    """A downgrade, re-upgrade, or loss of an existing apply actor breaks safe rollout."""
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("PLATFORM_INTEGRATION_DATABASE_URL", raising=False)
     config = _alembic_config(postgres_url)
@@ -245,9 +247,67 @@ def test_shadow_migration_is_reversible_using_only_the_testcontainer_url(postgre
     finally:
         engine.dispose()
 
-    command.upgrade(config, "head")
+    command.upgrade(config, "0001_shadow_foundation")
     engine = create_engine(postgres_url)
     try:
+        tenant_id = "00000000-0000-4000-8000-000000000001"
+        build_actor = "00000000-0000-4000-8000-000000000097"
+        apply_actor = "00000000-0000-4000-8000-000000000098"
+        plan_hash = "c" * 64
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO provisioning_plan (
+                        tenant_id, plan_hash, canonical_plan, tenant_snapshot,
+                        tb_tenant_id, cmms_company_id, actor_id, created_at,
+                        expires_at, applied_at, target_results, terminal_result
+                    ) VALUES (
+                        :tenant_id, :plan_hash, '{"targets":[]}', '{"alias":"pilot"}',
+                        :tenant_id, 201, :build_actor, :created_at,
+                        :expires_at, :applied_at, '{}', 'ACTIVE'
+                    )
+                    """
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "plan_hash": plan_hash,
+                    "build_actor": build_actor,
+                    "created_at": datetime(2026, 7, 30, 6, 0, tzinfo=UTC),
+                    "expires_at": datetime(2026, 7, 30, 6, 30, tzinfo=UTC),
+                    "applied_at": datetime(2026, 7, 30, 6, 5, tzinfo=UTC),
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO audit_event (
+                        tenant_id, actor_id, action, target_type, target_id,
+                        correlation_id, result_code, result_summary
+                    ) VALUES (
+                        :tenant_id, :apply_actor, 'PILOT_PROVISIONING_COMPLETED',
+                        'PROVISIONING_PLAN', :plan_hash, :tenant_id, 'ACTIVE', '{}'
+                    )
+                    """
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "plan_hash": plan_hash,
+                    "apply_actor": apply_actor,
+                },
+            )
+        command.upgrade(config, "head")
         assert EXPECTED_TABLES <= set(inspect(engine).get_table_names())
+        with engine.connect() as connection:
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT apply_actor_id::text FROM provisioning_plan "
+                        "WHERE plan_hash = :plan_hash"
+                    ),
+                    {"plan_hash": plan_hash},
+                ).scalar_one()
+                == apply_actor
+            )
     finally:
         engine.dispose()

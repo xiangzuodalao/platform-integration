@@ -2,7 +2,10 @@ import importlib
 import logging
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from uuid import UUID
 
+import pytest
 from fastapi import FastAPI
 
 
@@ -114,3 +117,61 @@ def test_main_passes_explicit_serve_address_to_uvicorn_without_disclosing_creden
     assert credential_sentinel not in captured.out
     assert credential_sentinel not in captured.err
     assert credential_sentinel not in caplog.text
+
+
+def test_provisioning_main_maps_unknown_failures_without_traceback_or_sensitive_details(
+    monkeypatch, capsys
+):
+    """An unhandled provider/database error could print secrets and absolute paths."""
+    cli = require_module("platform_integration.cli", "redacted provisioning CLI errors")
+    secret = "cli-sensitive-canary"
+    absolute_path = "/home/operator/private/runtime.env"
+
+    def fail(*_):
+        raise RuntimeError(f"{secret} at {absolute_path}")
+
+    monkeypatch.setattr(cli, "run_provision_plan", fail)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "platform-integration",
+            "provision-plan",
+            "--tenant-alias",
+            "ifactory-pilot",
+            "--actor",
+            "operator",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+
+    captured = capsys.readouterr()
+    exposed = captured.out + captured.err
+    assert exc_info.value.code == 2
+    assert captured.err == "error: PROVISIONING_COMMAND_FAILED\n"
+    assert secret not in exposed
+    assert absolute_path not in exposed
+    assert "Traceback" not in exposed
+
+
+def test_provisioning_receipt_output_includes_exact_apply_actor():
+    """Omitting the confirmer from CLI output makes the durable receipt incomplete."""
+    provision = require_module(
+        "platform_integration.commands.provision", "provisioning receipt output"
+    )
+    apply_actor = UUID("00000000-0000-4000-8000-000000000098")
+
+    receipt = provision._receipt(
+        SimpleNamespace(
+            tenant_id=UUID("00000000-0000-4000-8000-000000000001"),
+            plan_hash="a" * 64,
+            applied_at=None,
+            apply_actor=apply_actor,
+            terminal_result="ACTIVE",
+            target_results={},
+        )
+    )
+
+    assert receipt["apply_actor_id"] == str(apply_actor)
