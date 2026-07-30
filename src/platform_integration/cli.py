@@ -1,6 +1,7 @@
 import argparse
 import re
 import sys
+from datetime import datetime
 
 import uvicorn
 
@@ -11,6 +12,7 @@ from platform_integration.commands.provision import (
     run_provision_verify,
 )
 from platform_integration.commands.shadow import (
+    ShadowCommandError,
     parse_rfc3339,
     run_discover_identities,
     run_migrate,
@@ -28,6 +30,13 @@ def _sha256(value: str) -> str:
     if SHA256_RE.fullmatch(value) is None:
         raise argparse.ArgumentTypeError("lowercase SHA-256 required")
     return value
+
+
+def _isolated_once_now(arguments) -> datetime | None:
+    now = None if arguments.now is None else parse_rfc3339(arguments.now)
+    if now is not None and (not arguments.once or Settings().isolated_pilot_mode is not True):
+        raise ShadowCommandError("ISOLATED_PILOT_MODE_REQUIRED")
+    return now
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -57,6 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     scheduler.add_argument("--now")
     worker = commands.add_parser("prediction-worker", help="process eligible prediction rows")
     worker.add_argument("--once", action="store_true")
+    worker.add_argument("--now")
     summary = commands.add_parser("shadow-summary", help="print bounded shadow evidence")
     summary.add_argument("--tenant-alias", required=True)
     summary.add_argument("--scheduled-at", required=True)
@@ -86,16 +96,11 @@ def main() -> None:
         elif arguments.command == "discover-identities":
             run_discover_identities()
         elif arguments.command == "scheduler":
-            now = None if arguments.now is None else parse_rfc3339(arguments.now)
-            if now is not None and (
-                not arguments.once or Settings().isolated_pilot_mode is not True
-            ):
-                from platform_integration.commands.shadow import ShadowCommandError
-
-                raise ShadowCommandError("ISOLATED_PILOT_MODE_REQUIRED")
+            now = _isolated_once_now(arguments)
             run_scheduler(once=arguments.once, now=now)
         elif arguments.command == "prediction-worker":
-            run_prediction_worker(once=arguments.once)
+            now = _isolated_once_now(arguments)
+            run_prediction_worker(once=arguments.once, now=now)
         elif arguments.command == "shadow-summary":
             run_shadow_summary(
                 arguments.tenant_alias,

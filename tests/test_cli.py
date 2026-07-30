@@ -1,6 +1,7 @@
 import importlib
 import logging
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
@@ -187,7 +188,8 @@ def test_shadow_role_parsers_expose_only_bounded_explicit_operations():
     assert (discover.command, discover.format) == ("discover-identities", "env")
     scheduler = parser.parse_args(["scheduler", "--once", "--now", "2026-07-30T06:00:00Z"])
     assert scheduler.once and scheduler.now == "2026-07-30T06:00:00Z"
-    assert parser.parse_args(["prediction-worker", "--once"]).once
+    worker = parser.parse_args(["prediction-worker", "--once", "--now", "2026-07-30T06:00:00Z"])
+    assert worker.once and worker.now == "2026-07-30T06:00:00Z"
     summary = parser.parse_args(
         [
             "shadow-summary",
@@ -220,6 +222,149 @@ def test_scheduler_now_requires_once_and_explicit_isolated_pilot_mode(monkeypatc
     assert exc_info.value.code == 2
     assert calls == []
     assert capsys.readouterr().err == "error: ISOLATED_PILOT_MODE_REQUIRED\n"
+
+
+@pytest.mark.parametrize(
+    ("isolated_mode", "arguments"),
+    [
+        (None, ["--once", "--now", "2026-07-30T06:00:00Z"]),
+        ("1", ["--now", "2026-07-30T06:00:00Z"]),
+    ],
+)
+def test_prediction_worker_now_requires_once_and_explicit_isolated_pilot_mode(
+    monkeypatch,
+    capsys,
+    isolated_mode,
+    arguments,
+):
+    """Injected worker time outside a one-shot pilot could alter production eligibility."""
+    cli = require_module("platform_integration.cli", "isolated worker clock gate")
+    calls = []
+    if isolated_mode is None:
+        monkeypatch.delenv("PLATFORM_INTEGRATION_ISOLATED_PILOT_MODE", raising=False)
+    else:
+        monkeypatch.setenv("PLATFORM_INTEGRATION_ISOLATED_PILOT_MODE", isolated_mode)
+    monkeypatch.setattr(cli, "run_prediction_worker", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(sys, "argv", ["platform-integration", "prediction-worker", *arguments])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+
+    assert exc_info.value.code == 2
+    assert calls == []
+    assert capsys.readouterr().err == "error: ISOLATED_PILOT_MODE_REQUIRED\n"
+
+
+def test_prediction_worker_once_passes_normalized_fixed_time_in_isolated_mode(
+    monkeypatch,
+    capsys,
+):
+    """Dropping or misnormalizing --now makes a fixed scheduler slot unclaimable."""
+    cli = require_module("platform_integration.cli", "isolated worker clock injection")
+    calls = []
+    monkeypatch.setenv("PLATFORM_INTEGRATION_ISOLATED_PILOT_MODE", "1")
+    monkeypatch.setattr(cli, "run_prediction_worker", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "platform-integration",
+            "prediction-worker",
+            "--once",
+            "--now",
+            "2026-07-30T14:00:00+08:00",
+        ],
+    )
+
+    cli.main()
+
+    assert calls == [
+        {
+            "once": True,
+            "now": datetime(2026, 7, 30, 6, 0, tzinfo=UTC),
+        }
+    ]
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    "invalid_now",
+    [
+        "2026-07-30 06:00:00Z",
+        "2026-07-30T06:00Z",
+        "2026-07-30T06:00:00+0000",
+        "2026-07-30T06:00:00Z-sensitive-clock-canary",
+    ],
+)
+def test_prediction_worker_now_requires_strict_rfc3339_without_echoing_input(
+    monkeypatch,
+    capsys,
+    invalid_now,
+):
+    """Permissive parsing or echoed input would weaken the isolated clock boundary."""
+    cli = require_module("platform_integration.cli", "strict redacted worker clock parsing")
+    calls = []
+    monkeypatch.setenv("PLATFORM_INTEGRATION_ISOLATED_PILOT_MODE", "1")
+    monkeypatch.setattr(cli, "run_prediction_worker", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "platform-integration",
+            "prediction-worker",
+            "--once",
+            "--now",
+            invalid_now,
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+
+    captured = capsys.readouterr()
+    assert exc_info.value.code == 2
+    assert calls == []
+    assert captured.err == "error: RFC3339_TIMESTAMP_REQUIRED\n"
+    assert invalid_now not in captured.out + captured.err
+
+
+@pytest.mark.parametrize(
+    "overflowing_now",
+    [
+        "9999-12-31T23:59:59-23:59",
+        "0001-01-01T00:00:00+23:59",
+    ],
+)
+def test_prediction_worker_now_maps_utc_normalization_overflow_to_redacted_rfc3339_error(
+    monkeypatch,
+    capsys,
+    overflowing_now,
+):
+    """UTC year overflow must remain a validation error and never enter the worker."""
+    cli = require_module("platform_integration.cli", "bounded RFC3339 UTC normalization")
+    calls = []
+    monkeypatch.setenv("PLATFORM_INTEGRATION_ISOLATED_PILOT_MODE", "1")
+    monkeypatch.setattr(cli, "run_prediction_worker", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "platform-integration",
+            "prediction-worker",
+            "--once",
+            "--now",
+            overflowing_now,
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+
+    captured = capsys.readouterr()
+    assert exc_info.value.code == 2
+    assert calls == []
+    assert captured.err == "error: RFC3339_TIMESTAMP_REQUIRED\n"
+    assert overflowing_now not in captured.out + captured.err
 
 
 def test_migrate_failure_is_nonzero_and_redacted(monkeypatch, capsys):

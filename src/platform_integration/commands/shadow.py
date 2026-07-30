@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import signal
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -26,6 +27,7 @@ from platform_integration.workers.scheduler import Scheduler, floor_slot
 
 
 COMPONENT_ROOT = Path(__file__).parents[3]
+RFC3339_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
 
 
 class ShadowCommandError(RuntimeError):
@@ -35,15 +37,16 @@ class ShadowCommandError(RuntimeError):
 
 
 def parse_rfc3339(value: str) -> datetime:
-    if type(value) is not str:
+    if type(value) is not str or RFC3339_RE.fullmatch(value) is None:
         raise ShadowCommandError("RFC3339_TIMESTAMP_REQUIRED")
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        normalized = f"{value[:-1]}+00:00" if value.endswith("Z") else value
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.utcoffset() is None:
+            raise ShadowCommandError("RFC3339_TIMESTAMP_REQUIRED")
+        return parsed.astimezone(UTC)
+    except (ValueError, OverflowError):
         raise ShadowCommandError("RFC3339_TIMESTAMP_REQUIRED") from None
-    if parsed.utcoffset() is None:
-        raise ShadowCommandError("RFC3339_TIMESTAMP_REQUIRED")
-    return parsed.astimezone(UTC)
 
 
 def _database_settings() -> tuple[Settings, object]:
@@ -149,7 +152,12 @@ class _PredictionRuntime:
         await self.sessions.kw["bind"].dispose()
 
 
-def _prediction_runtime(settings: Settings, sessions) -> _PredictionRuntime:
+def _prediction_runtime(
+    settings: Settings,
+    sessions,
+    *,
+    now: datetime | None = None,
+) -> _PredictionRuntime:
     if (
         settings.tenant_id is None
         or settings.tb_base_url is None
@@ -162,6 +170,7 @@ def _prediction_runtime(settings: Settings, sessions) -> _PredictionRuntime:
     tb_http = httpx.AsyncClient(base_url=str(settings.tb_base_url))
     pdm_http = httpx.AsyncClient(base_url=str(settings.pdm_base_url))
     store = ShadowExecutionStore(sessions=sessions, tenant_id=settings.tenant_id)
+    clock = (lambda: datetime.now(UTC)) if now is None else (lambda: now)
     processor = PredictionProcessor(
         store=store,
         thingsboard=ThingsBoardClient(
@@ -178,14 +187,14 @@ def _prediction_runtime(settings: Settings, sessions) -> _PredictionRuntime:
         risk_evaluator=RiskEvaluator(),
         runtime_tb_credential_ref=str(settings.tb_credential_ref),
         runtime_pdm_credential_ref=str(settings.pdm_credential_ref),
-        clock=lambda: datetime.now(UTC),
+        clock=clock,
     )
     return _PredictionRuntime(
         worker=PredictionWorker(
             store=store,
             processor=processor,
             owner=f"worker-{id(processor):x}",
-            clock=lambda: datetime.now(UTC),
+            clock=clock,
         ),
         tb_http=tb_http,
         pdm_http=pdm_http,
@@ -193,9 +202,9 @@ def _prediction_runtime(settings: Settings, sessions) -> _PredictionRuntime:
     )
 
 
-async def _prediction_worker(*, once: bool) -> None:
+async def _prediction_worker(*, once: bool, now: datetime | None = None) -> None:
     settings, sessions = _database_settings()
-    runtime = _prediction_runtime(settings, sessions)
+    runtime = _prediction_runtime(settings, sessions, now=now)
     stopped = asyncio.Event()
     _install_stop_handlers(stopped)
     try:
@@ -212,8 +221,8 @@ async def _prediction_worker(*, once: bool) -> None:
         await runtime.close()
 
 
-def run_prediction_worker(*, once: bool) -> None:
-    asyncio.run(_prediction_worker(once=once))
+def run_prediction_worker(*, once: bool, now: datetime | None = None) -> None:
+    asyncio.run(_prediction_worker(once=once, now=now))
 
 
 async def _shadow_summary(tenant_alias: str, scheduled_at: datetime) -> None:
