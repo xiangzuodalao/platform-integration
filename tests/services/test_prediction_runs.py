@@ -157,6 +157,7 @@ async def test_success_persists_only_summary_and_updates_risk_in_the_same_transa
             forecast_max=Decimal("8.50"),
             forecast_mean=Decimal("7.60"),
         )
+        assert await store.pin_request(claim, prepared, now=next_slot)
         await store.succeed(claim, prepared, response, risk)
 
         async with sessions() as session:
@@ -292,6 +293,8 @@ async def test_two_worker_first_risk_state_upsert_is_race_safe_and_newest_round_
             forecast_max=Decimal("8.50"),
             forecast_mean=Decimal("7.60"),
         )
+        assert await store.pin_request(first, prepared, now=first_slot)
+        assert await store.pin_request(second, prepared, now=second_slot)
 
         await asyncio.gather(
             store.succeed(first, prepared, response, risk),
@@ -395,6 +398,7 @@ async def test_persisted_internal_state_requires_two_risky_and_two_healthy_round
                     slot,
                 )
             else:
+                assert await store.pin_request(claim, prepared, now=slot)
                 await store.succeed(claim, prepared, response, round_risk)
             async with sessions() as session:
                 state = await session.get(
@@ -463,6 +467,19 @@ async def test_transient_retry_of_the_same_run_can_apply_a_later_success(databas
                     RiskEvaluationState.meas_code == "vibration_rms",
                 )
             )
+            session.add(
+                RiskEvaluationState(
+                    tenant_id=TENANT_ID,
+                    equipment_id=EQUIPMENT_ID,
+                    meas_code="vibration_rms",
+                    policy_version="pilot-policy-v1",
+                    consecutive_risk_count=2,
+                    consecutive_healthy_count=1,
+                    internal_active=True,
+                    alarm_aggregate_version=0,
+                    version=1,
+                )
+            )
             await PredictionRunRepository(session).create_slot(
                 tenant_id=TENANT_ID,
                 equipment_id=EQUIPMENT_ID,
@@ -472,15 +489,31 @@ async def test_transient_retry_of_the_same_run_can_apply_a_later_success(databas
         store = ShadowExecutionStore(sessions=sessions, tenant_id=TENANT_ID)
         first = await store.claim_next("worker-retry-a", slot)
         assert first is not None
+        assert await store.pin_request(first, prepared, now=slot)
         await store.fail(
             first,
             "PDM_UNAVAILABLE",
             transient=True,
             now=slot + timedelta(minutes=1),
         )
+        async with sessions() as session:
+            failed_state = await session.get(
+                RiskEvaluationState,
+                (TENANT_ID, EQUIPMENT_ID, "vibration_rms"),
+            )
+        assert failed_state is not None
+        assert failed_state.last_prediction_run_id == first.run_id
+        assert failed_state.consecutive_risk_count == 0
+        assert failed_state.consecutive_healthy_count == 0
+        assert failed_state.internal_active
         retry = await store.claim_next("worker-retry-b", slot + timedelta(minutes=1))
         assert retry is not None
         assert retry.run_id == first.run_id
+        assert await store.pin_request(
+            retry,
+            prepared,
+            now=slot + timedelta(minutes=1),
+        )
         await store.succeed(retry, prepared, response, risk)
 
         async with sessions() as session:
@@ -491,6 +524,164 @@ async def test_transient_retry_of_the_same_run_can_apply_a_later_success(databas
         assert state is not None
         assert state.last_prediction_run_id == first.run_id
         assert state.consecutive_risk_count == 1
-        assert not state.internal_active
+        assert state.internal_active
+    finally:
+        await sessions.kw["bind"].dispose()
+
+
+async def test_retry_request_drift_terminalizes_without_overwriting_the_pinned_snapshot(
+    database_url,
+):
+    """Rebuilding a different request for one run breaks retry idempotency and audit identity."""
+    from platform_integration.db import create_async_sessionmaker
+    from platform_integration.models.prediction import PredictionRun
+    from platform_integration.repositories.prediction_runs import PredictionRunRepository
+    from platform_integration.services.prediction_runs import ShadowExecutionStore
+
+    sessions = create_async_sessionmaker(database_url)
+    slot = SLOT + timedelta(hours=6)
+    first_prepared = SimpleNamespace(
+        request=SimpleNamespace(request_digest="8" * 64),
+        quality_summary={
+            "distinct_bucket_count": 66,
+            "missing_bucket_count": 0,
+            "raw_record_count": 66,
+        },
+    )
+    changed_prepared = SimpleNamespace(
+        request=SimpleNamespace(request_digest="9" * 64),
+        quality_summary=first_prepared.quality_summary,
+    )
+    try:
+        await seed_binding(sessions)
+        async with sessions() as session, session.begin():
+            await PredictionRunRepository(session).create_slot(
+                tenant_id=TENANT_ID,
+                equipment_id=EQUIPMENT_ID,
+                meas_code="vibration_rms",
+                scheduled_at=slot,
+            )
+        store = ShadowExecutionStore(sessions=sessions, tenant_id=TENANT_ID)
+        first = await store.claim_next("worker-drift-a", slot)
+        assert first is not None
+        assert await store.pin_request(first, first_prepared, now=slot)
+        await store.fail(
+            first,
+            "PDM_UNAVAILABLE",
+            transient=True,
+            now=slot + timedelta(minutes=1),
+        )
+        retry = await store.claim_next("worker-drift-b", slot + timedelta(minutes=1))
+        assert retry is not None
+        assert retry.run_id == first.run_id
+
+        assert not await store.pin_request(
+            retry,
+            changed_prepared,
+            now=slot + timedelta(minutes=1),
+        )
+
+        async with sessions() as session:
+            run = await session.get(PredictionRun, first.run_id)
+        assert run is not None
+        assert run.status == "FAILED"
+        assert run.error_code == "PREDICTION_REQUEST_DRIFT"
+        assert run.attempt == 3
+        assert run.request_digest == "8" * 64
+        assert run.model_profile_id == "pilot-cnc-vibration"
+        assert run.model_info_id == "pilot-fixture-v1-cnc-vibration"
+        assert run.preprocessing_version == "pdm-v2-pilot-1"
+        assert run.policy_version == "pilot-policy-v1"
+        assert run.quality_summary == first_prepared.quality_summary
+    finally:
+        await sessions.kw["bind"].dispose()
+
+
+async def test_slot_batch_rolls_back_all_rows_when_one_insert_fails(database_url):
+    """The scheduler batch must not commit a prefix if a later binding is invalid."""
+    from sqlalchemy.exc import DataError
+
+    from platform_integration.db import create_async_sessionmaker
+    from platform_integration.models.prediction import PredictionRun
+    from platform_integration.services.prediction_runs import ShadowExecutionStore
+
+    sessions = create_async_sessionmaker(database_url)
+    slot = SLOT + timedelta(days=2)
+    bindings = [
+        SimpleNamespace(
+            tenant_id=TENANT_ID,
+            equipment_id=UUID(f"71000000-0000-4000-8000-{index:012d}"),
+            meas_code=f"batch-{index:02d}",
+        )
+        for index in range(20)
+    ]
+    bindings[-1].meas_code = "x" * 101
+    try:
+        await seed_binding(sessions)
+        store = ShadowExecutionStore(sessions=sessions, tenant_id=TENANT_ID)
+
+        with pytest.raises(DataError):
+            await store.create_slot_batch(bindings, scheduled_at=slot)
+
+        async with sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(PredictionRun).where(PredictionRun.scheduled_at == slot)
+                )
+            ).all()
+        assert rows == []
+    finally:
+        await sessions.kw["bind"].dispose()
+
+
+async def test_shadow_summary_service_queries_one_complete_twenty_mapping_slot(
+    database_url,
+):
+    """The production query path must preserve the exact pilot-slot evidence boundary."""
+    from platform_integration.db import create_async_sessionmaker
+    from platform_integration.models.bindings import EquipmentMapping
+    from platform_integration.models.prediction import PredictionRun
+    from platform_integration.services.shadow_summary import ShadowSummaryService
+
+    sessions = create_async_sessionmaker(database_url)
+    slot = SLOT + timedelta(days=3)
+    try:
+        await seed_binding(sessions)
+        async with sessions() as session, session.begin():
+            for index in range(20):
+                equipment_id = UUID(f"72000000-0000-4000-8000-{index:012d}")
+                session.add(
+                    EquipmentMapping(
+                        tenant_id=TENANT_ID,
+                        equipment_id=equipment_id,
+                        tb_device_id=UUID(f"73000000-0000-4000-8000-{index:012d}"),
+                        cmms_asset_id=9000 + index,
+                        cmms_request_digest=f"{index:064x}",
+                        status="ACTIVE",
+                        enabled=True,
+                    )
+                )
+                session.add(
+                    PredictionRun(
+                        tenant_id=TENANT_ID,
+                        equipment_id=equipment_id,
+                        meas_code=f"summary-{index:02d}",
+                        scheduled_at=slot,
+                        status="SUCCEEDED",
+                        attempt=1,
+                        model_profile_id=f"profile-{index % 4}",
+                        model_artifact_sha256=f"{index % 4:x}" * 64,
+                    )
+                )
+
+        summary = await ShadowSummaryService(sessions=sessions).load(
+            tenant_alias="shadow-store-test",
+            scheduled_at=slot,
+            expected_tenant_id=TENANT_ID,
+        )
+
+        assert len(summary["mappings"]) == 20
+        assert sum(summary["status_counts"].values()) == 20
+        assert summary["status_counts"] == {"SUCCEEDED": 20}
     finally:
         await sessions.kw["bind"].dispose()

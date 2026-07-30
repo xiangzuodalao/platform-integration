@@ -61,6 +61,47 @@ def test_shadow_summary_rejects_more_than_100_rows_instead_of_truncating():
         )
 
 
+@pytest.mark.parametrize("size", [0, 19, 21])
+def test_shadow_summary_requires_exactly_twenty_rows(size):
+    """A phase-gate summary must represent one complete pilot slot."""
+    from platform_integration.services.shadow_summary import (
+        ShadowSummaryError,
+        build_shadow_summary,
+    )
+
+    with pytest.raises(
+        ShadowSummaryError,
+        match="SHADOW_SUMMARY_BATCH_SIZE_INVALID",
+    ):
+        build_shadow_summary(
+            tenant_alias="ifactory-pilot",
+            tenant_id=UUID("00000000-0000-4000-8000-000000000001"),
+            scheduled_at=SLOT,
+            rows=[run(index) for index in range(size)],
+        )
+
+
+def test_shadow_summary_rejects_duplicate_mapping_identity():
+    """Duplicate mappings could hide one missing pilot binding while preserving count 20."""
+    from platform_integration.services.shadow_summary import (
+        ShadowSummaryError,
+        build_shadow_summary,
+    )
+
+    rows = [run(index) for index in range(20)]
+    rows[-1] = dict(rows[0])
+    with pytest.raises(
+        ShadowSummaryError,
+        match="SHADOW_SUMMARY_IDENTITY_DUPLICATE",
+    ):
+        build_shadow_summary(
+            tenant_alias="ifactory-pilot",
+            tenant_id=UUID("00000000-0000-4000-8000-000000000001"),
+            scheduled_at=SLOT,
+            rows=rows,
+        )
+
+
 def test_shadow_summary_rejects_a_non_slot_timestamp():
     """A fuzzy requested timestamp could mix evidence from different scheduler slots."""
     from platform_integration.services.shadow_summary import (

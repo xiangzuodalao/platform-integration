@@ -94,12 +94,8 @@ class PredictionRequestBuilder:
         binding: object,
         points: tuple[TelemetryPoint, ...],
     ) -> list[HistoryPointV2]:
-        occurrences: dict[tuple[int, str, str], int] = {}
         result: list[HistoryPointV2] = []
         for point in points:
-            occurrence_key = (point.timestamp, point.value, point.unit)
-            occurrence = occurrences.get(occurrence_key, 0)
-            occurrences[occurrence_key] = occurrence + 1
             identity = {
                 "tenant_id": str(binding.tenant_id),
                 "tb_device_id": str(binding.tb_device_id),
@@ -108,8 +104,6 @@ class PredictionRequestBuilder:
                 "value": point.value,
                 "unit": point.unit,
             }
-            if occurrence:
-                identity["occurrence"] = occurrence
             result.append(
                 HistoryPointV2(
                     data_id=_digest(identity),

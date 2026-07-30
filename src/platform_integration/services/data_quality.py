@@ -67,6 +67,7 @@ class DataQualityEvaluator:
         window_start = window_end - window_points * INTERVAL_MS
         expected_unit = canonical_unit(binding.unit)
         canonical: list[TelemetryPoint] = []
+        identities: set[tuple[int, str, str]] = set()
         for raw in points:
             if raw.timestamp >= window_end:
                 return self._failed("FUTURE_TIMESTAMP", canonical, window_points)
@@ -82,7 +83,11 @@ class DataQualityEvaluator:
                 value = canonical_decimal(raw.value, scale=int(binding.value_scale))
             except ValueError:
                 return self._failed("NON_FINITE_VALUE", canonical, window_points)
-            canonical.append(TelemetryPoint(raw.timestamp, value, unit))
+            identity = (raw.timestamp, value, unit)
+            if identity in identities:
+                return self._failed("DUPLICATE_RAW_RECORD", canonical, window_points)
+            identities.add(identity)
+            canonical.append(TelemetryPoint(*identity))
 
         occupied = {point.timestamp for point in canonical}
         missing_indexes = [

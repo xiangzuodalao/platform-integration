@@ -3,6 +3,13 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 
+PILOT_BINDING_COUNT = 20
+
+
+class SchedulerBatchError(ValueError):
+    pass
+
+
 def floor_slot(now: datetime, interval_minutes: int = 15) -> datetime:
     if now.utcoffset() is None:
         raise ValueError("timezone-aware datetime required")
@@ -22,11 +29,11 @@ class Scheduler:
         bindings = self._active_bindings()
         if hasattr(bindings, "__await__"):
             bindings = await bindings
-        for binding in bindings:
-            await self._store.create_slot(
-                tenant_id=binding.tenant_id,
-                equipment_id=binding.equipment_id,
-                meas_code=binding.meas_code,
-                scheduled_at=slot,
-            )
+        bindings = list(bindings)
+        identities = {
+            (binding.tenant_id, binding.equipment_id, binding.meas_code) for binding in bindings
+        }
+        if len(bindings) != PILOT_BINDING_COUNT or len(identities) != PILOT_BINDING_COUNT:
+            raise SchedulerBatchError("SCHEDULER_BINDING_BATCH_INVALID")
+        await self._store.create_slot_batch(bindings, scheduled_at=slot)
         return len(bindings)

@@ -8,6 +8,11 @@ import pytest
 
 SLOT = datetime(2026, 7, 30, 6, 0, tzinfo=UTC)
 RUN_ID = UUID("00000000-0000-4000-8000-000000000501")
+QUALITY_SUMMARY = {
+    "distinct_bucket_count": 66,
+    "missing_bucket_count": 0,
+    "raw_record_count": 66,
+}
 
 
 class QueueStore:
@@ -18,6 +23,7 @@ class QueueStore:
         self.failures = []
         self.skips = []
         self.reconciliations = []
+        self.pin_requests = []
 
     async def reconcile_stale(self, now):
         self.reconciliations.append(now)
@@ -33,6 +39,10 @@ class QueueStore:
 
     async def succeed(self, claim, prepared, response, risk):
         self.successes.append((claim, prepared, response, risk))
+
+    async def pin_request(self, claim, prepared, *, now):
+        self.pin_requests.append((claim, prepared, now))
+        return True
 
     async def fail(self, claim, code, *, transient, now):
         self.failures.append((claim, code, transient, now))
@@ -58,6 +68,8 @@ def claim(attempt=1):
             telemetry_key="vibration",
             unit="mm/s",
             value_scale=2,
+            tb_credential_ref="TB_TEST_CREDENTIAL",
+            pdm_credential_ref="PDM_TEST_CREDENTIAL",
         ),
     )
 
@@ -212,6 +224,8 @@ async def test_quality_failure_skips_without_calling_pdm_or_any_alarm_mutation()
         pdm=Pdm(),
         request_builder=Builder(),
         risk_evaluator=SimpleNamespace(),
+        runtime_tb_credential_ref="TB_TEST_CREDENTIAL",
+        runtime_pdm_credential_ref="PDM_TEST_CREDENTIAL",
         clock=lambda: SLOT,
     )
     await processor.process(claim())
@@ -226,7 +240,7 @@ async def test_transient_pdm_failure_is_bounded_by_attempt_three_and_slot_deadli
 
     class Builder:
         def prepare(self, *_):
-            return SimpleNamespace(request=object(), quality_summary={})
+            return SimpleNamespace(request=object(), quality_summary=QUALITY_SUMMARY)
 
     class Pdm:
         def __init__(self, code="PDM_UNAVAILABLE"):
@@ -253,6 +267,8 @@ async def test_transient_pdm_failure_is_bounded_by_attempt_three_and_slot_deadli
             pdm=Pdm(),
             request_builder=Builder(),
             risk_evaluator=SimpleNamespace(),
+            runtime_tb_credential_ref="TB_TEST_CREDENTIAL",
+            runtime_pdm_credential_ref="PDM_TEST_CREDENTIAL",
             clock=lambda now=now: now,
         )
         await processor.process(claim(attempt))
@@ -265,6 +281,8 @@ async def test_transient_pdm_failure_is_bounded_by_attempt_three_and_slot_deadli
         pdm=Pdm("PDM_REQUEST_FAILED"),
         request_builder=Builder(),
         risk_evaluator=SimpleNamespace(),
+        runtime_tb_credential_ref="TB_TEST_CREDENTIAL",
+        runtime_pdm_credential_ref="PDM_TEST_CREDENTIAL",
         clock=lambda: SLOT + timedelta(minutes=1),
     )
     await processor.process(claim(1))
@@ -293,6 +311,8 @@ async def test_thingsboard_unavailable_retries_without_calling_pdm():
         pdm=Pdm(),
         request_builder=SimpleNamespace(),
         risk_evaluator=SimpleNamespace(),
+        runtime_tb_credential_ref="TB_TEST_CREDENTIAL",
+        runtime_pdm_credential_ref="PDM_TEST_CREDENTIAL",
         clock=lambda: SLOT + timedelta(minutes=1),
     )
 
@@ -312,7 +332,7 @@ async def test_invalid_forecast_is_terminalized_without_retry():
 
     class Builder:
         def prepare(self, *_args):
-            return SimpleNamespace(request=object(), quality_summary={})
+            return SimpleNamespace(request=object(), quality_summary=QUALITY_SUMMARY)
 
     class Pdm:
         async def predict(self, _request):
@@ -329,9 +349,102 @@ async def test_invalid_forecast_is_terminalized_without_retry():
         pdm=Pdm(),
         request_builder=Builder(),
         risk_evaluator=Risk(),
+        runtime_tb_credential_ref="TB_TEST_CREDENTIAL",
+        runtime_pdm_credential_ref="PDM_TEST_CREDENTIAL",
         clock=lambda: SLOT + timedelta(minutes=1),
     )
 
     await processor.process(claim())
 
     assert store.failures[0][1:3] == ("PDM_INVALID_FORECAST", False)
+
+
+async def test_claim_credential_refs_must_match_runtime_before_external_calls():
+    """A stale claim must not route tenant work through different runtime credentials."""
+    from platform_integration.workers.prediction import PredictionProcessor
+
+    calls = []
+
+    class Tb:
+        async def historical_telemetry(self, *_args, **_kwargs):
+            calls.append("tb")
+            return ()
+
+    class Pdm:
+        async def predict(self, _request):
+            calls.append("pdm")
+
+    owned = claim()
+    owned.binding.tb_credential_ref = "TB_DIFFERENT_CREDENTIAL"
+    store = QueueStore([])
+    processor = PredictionProcessor(
+        store=store,
+        thingsboard=Tb(),
+        pdm=Pdm(),
+        request_builder=SimpleNamespace(),
+        risk_evaluator=SimpleNamespace(),
+        runtime_tb_credential_ref="TB_TEST_CREDENTIAL",
+        runtime_pdm_credential_ref="PDM_TEST_CREDENTIAL",
+        clock=lambda: SLOT,
+    )
+
+    await processor.process(owned)
+
+    assert calls == []
+    assert store.failures[0][1:3] == (
+        "PREDICTION_CREDENTIAL_REF_MISMATCH",
+        False,
+    )
+
+
+async def test_request_is_pinned_before_pdm_and_drift_prevents_the_call():
+    """PDM must never observe an unpinned or drifted retry request."""
+    from platform_integration.workers.prediction import PredictionProcessor
+
+    events = []
+
+    class Store(QueueStore):
+        def __init__(self, pin_result):
+            super().__init__([])
+            self.pin_result = pin_result
+
+        async def pin_request(self, owned, prepared, *, now):
+            await super().pin_request(owned, prepared, now=now)
+            events.append("pin")
+            return self.pin_result
+
+    class Tb:
+        async def historical_telemetry(self, *_args, **_kwargs):
+            return ()
+
+    class Builder:
+        def prepare(self, *_args):
+            return SimpleNamespace(request=object(), quality_summary=QUALITY_SUMMARY)
+
+    class Pdm:
+        async def predict(self, _request):
+            events.append("pdm")
+            return SimpleNamespace(forecast=())
+
+    class Risk:
+        def evaluate(self, *_args):
+            return SimpleNamespace()
+
+    for pin_result, expected in ((True, ["pin", "pdm"]), (False, ["pin"])):
+        events.clear()
+        store = Store(pin_result)
+        processor = PredictionProcessor(
+            store=store,
+            thingsboard=Tb(),
+            pdm=Pdm(),
+            request_builder=Builder(),
+            risk_evaluator=Risk(),
+            runtime_tb_credential_ref="TB_TEST_CREDENTIAL",
+            runtime_pdm_credential_ref="PDM_TEST_CREDENTIAL",
+            clock=lambda: SLOT,
+        )
+
+        await processor.process(claim())
+
+        assert events == expected
+        assert len(store.successes) == int(pin_result)

@@ -176,6 +176,8 @@ def _prediction_runtime(settings: Settings, sessions) -> _PredictionRuntime:
         ),
         request_builder=PredictionRequestBuilder(),
         risk_evaluator=RiskEvaluator(),
+        runtime_tb_credential_ref=str(settings.tb_credential_ref),
+        runtime_pdm_credential_ref=str(settings.pdm_credential_ref),
         clock=lambda: datetime.now(UTC),
     )
     return _PredictionRuntime(

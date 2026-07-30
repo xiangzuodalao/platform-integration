@@ -77,6 +77,8 @@ class PredictionProcessor:
         pdm,
         request_builder,
         risk_evaluator,
+        runtime_tb_credential_ref: str,
+        runtime_pdm_credential_ref: str,
         clock,
     ) -> None:
         self._store = store
@@ -84,10 +86,23 @@ class PredictionProcessor:
         self._pdm = pdm
         self._request_builder = request_builder
         self._risk_evaluator = risk_evaluator
+        self._runtime_tb_credential_ref = runtime_tb_credential_ref
+        self._runtime_pdm_credential_ref = runtime_pdm_credential_ref
         self._clock = clock
 
     async def process(self, claim) -> None:
         binding = claim.binding
+        if (
+            binding.tb_credential_ref != self._runtime_tb_credential_ref
+            or binding.pdm_credential_ref != self._runtime_pdm_credential_ref
+        ):
+            await self._store.fail(
+                claim,
+                "PREDICTION_CREDENTIAL_REF_MISMATCH",
+                transient=False,
+                now=self._clock(),
+            )
+            return
         window_end = int(claim.scheduled_at.timestamp() * 1000)
         window_start = window_end - int(binding.request_window_points) * INTERVAL_MS
         try:
@@ -115,6 +130,8 @@ class PredictionProcessor:
             )
         except DataQualityError as exc:
             await self._store.skip(claim, exc.code, exc.summary, self._clock())
+            return
+        if not await self._store.pin_request(claim, prepared, now=self._clock()):
             return
         try:
             response = await self._pdm.predict(prepared.request)

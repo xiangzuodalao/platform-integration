@@ -126,6 +126,31 @@ class ShadowExecutionStore:
                 scheduled_at=scheduled_at,
             )
 
+    async def create_slot_batch(
+        self,
+        bindings: list[PredictionTarget],
+        *,
+        scheduled_at: datetime,
+    ) -> list[PredictionRun]:
+        identities = {
+            (binding.tenant_id, binding.equipment_id, binding.meas_code) for binding in bindings
+        }
+        if len(bindings) != 20 or len(identities) != 20:
+            raise ValueError("SCHEDULER_BINDING_BATCH_INVALID")
+        if any(binding.tenant_id != self._tenant_id for binding in bindings):
+            raise ValueError("TENANT_SCOPE_MISMATCH")
+        async with self._sessions() as session, session.begin():
+            repository = PredictionRunRepository(session)
+            return [
+                await repository.create_slot(
+                    tenant_id=binding.tenant_id,
+                    equipment_id=binding.equipment_id,
+                    meas_code=binding.meas_code,
+                    scheduled_at=scheduled_at,
+                )
+                for binding in bindings
+            ]
+
     async def claim_next(self, owner: str, now: datetime) -> ClaimedPrediction | None:
         async with self._sessions() as session, session.begin():
             while True:
@@ -258,8 +283,43 @@ class ShadowExecutionStore:
             )
             if not changed:
                 raise RuntimeError("PREDICTION_LEASE_LOST")
-            if not transient:
-                await self._reset_risk_counters(session, claim)
+            await self._reset_risk_counters(session, claim)
+
+    async def pin_request(self, claim, prepared, *, now: datetime) -> bool:
+        quality_summary = self._bounded_quality_summary(prepared.quality_summary)
+        async with self._sessions() as session, session.begin():
+            run = await session.scalar(
+                select(PredictionRun)
+                .where(
+                    PredictionRun.run_id == claim.run_id,
+                    PredictionRun.status == "RUNNING",
+                    PredictionRun.lease_owner == claim.lease_owner,
+                )
+                .with_for_update()
+            )
+            if run is None:
+                raise RuntimeError("PREDICTION_LEASE_LOST")
+            if run.request_digest is None:
+                run.request_digest = prepared.request.request_digest
+                run.model_profile_id = claim.binding.model_profile_id
+                run.model_info_id = claim.binding.model_info_id
+                run.preprocessing_version = claim.binding.preprocessing_version
+                run.policy_version = claim.binding.policy_version
+                run.quality_summary = quality_summary
+                return True
+            if self._snapshot_matches(run, claim, prepared, quality_summary):
+                return True
+            changed = await PredictionRunRepository(session).mark_failed(
+                claim.run_id,
+                claim.lease_owner,
+                now,
+                code="PREDICTION_REQUEST_DRIFT",
+                retryable=False,
+            )
+            if not changed:
+                raise RuntimeError("PREDICTION_LEASE_LOST")
+            await self._reset_risk_counters(session, claim)
+            return False
 
     async def skip(
         self,
@@ -293,14 +353,21 @@ class ShadowExecutionStore:
             )
             if run is None:
                 raise RuntimeError("PREDICTION_LEASE_LOST")
-            run.model_profile_id = claim.binding.model_profile_id
-            run.model_info_id = claim.binding.model_info_id
-            run.preprocessing_version = claim.binding.preprocessing_version
-            run.policy_version = claim.binding.policy_version
-            run.request_digest = prepared.request.request_digest
+            quality_summary = self._bounded_quality_summary(prepared.quality_summary)
+            if not self._snapshot_matches(run, claim, prepared, quality_summary):
+                changed = await PredictionRunRepository(session).mark_failed(
+                    claim.run_id,
+                    claim.lease_owner,
+                    datetime.now(run.scheduled_at.tzinfo),
+                    code="PREDICTION_REQUEST_DRIFT",
+                    retryable=False,
+                )
+                if not changed:
+                    raise RuntimeError("PREDICTION_LEASE_LOST")
+                await self._reset_risk_counters(session, claim)
+                return
             run.input_digest = response.input_digest
             run.model_artifact_sha256 = response.model_artifact_sha256
-            run.quality_summary = dict(prepared.quality_summary)
             run.forecast_min = risk.forecast_min
             run.forecast_max = risk.forecast_max
             run.forecast_mean = risk.forecast_mean
@@ -324,6 +391,39 @@ class ShadowExecutionStore:
             state.internal_active = next_state.active
             state.last_prediction_run_id = run.run_id
             state.version += 1
+
+    @staticmethod
+    def _bounded_quality_summary(summary: object) -> dict[str, int]:
+        keys = {
+            "distinct_bucket_count",
+            "missing_bucket_count",
+            "raw_record_count",
+        }
+        if type(summary) is not dict or set(summary) != keys:
+            raise ValueError("QUALITY_SUMMARY_INVALID")
+        result: dict[str, int] = {}
+        for key in sorted(keys):
+            value = summary[key]
+            if type(value) is not int or value < 0 or value > 10_000:
+                raise ValueError("QUALITY_SUMMARY_INVALID")
+            result[key] = value
+        return result
+
+    @staticmethod
+    def _snapshot_matches(
+        run: PredictionRun,
+        claim,
+        prepared,
+        quality_summary: dict[str, int],
+    ) -> bool:
+        return (
+            run.request_digest == prepared.request.request_digest
+            and run.model_profile_id == claim.binding.model_profile_id
+            and run.model_info_id == claim.binding.model_info_id
+            and run.preprocessing_version == claim.binding.preprocessing_version
+            and run.policy_version == claim.binding.policy_version
+            and run.quality_summary == quality_summary
+        )
 
     async def _reset_risk_counters(self, session, claim) -> None:
         state = await self._locked_state(session, claim)

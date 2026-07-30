@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from uuid import UUID
 
 import rfc8785
+import pytest
 
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
@@ -96,17 +97,19 @@ def test_builder_preserves_duplicate_raw_records_and_stably_sorts_their_data_ids
     assert first_two[0] != first_two[1]
 
 
-def test_same_timestamp_and_value_duplicates_receive_stable_occurrence_data_ids():
-    """Identical provider rows sharing a data ID would be rejected by PDM as duplicate identity."""
-    from platform_integration.services.prediction_requests import PredictionRequestBuilder
+def test_same_timestamp_and_value_duplicate_is_rejected_before_pdm():
+    """Extending data_id with occurrence would drift from the fixed six-key contract."""
+    from platform_integration.services.prediction_requests import (
+        DataQualityError,
+        PredictionRequestBuilder,
+    )
 
     identical = points() + [points()[0]]
-    request = PredictionRequestBuilder().build(binding(), identical, CORRELATION_ID)
-    repeated = [item.data_id for item in request.history if item.timestamp == WINDOW_START_MS]
 
-    assert len(repeated) == 2
-    assert len(set(repeated)) == 2
-    assert repeated == sorted(repeated)
+    with pytest.raises(DataQualityError) as exc_info:
+        PredictionRequestBuilder().build(binding(), identical, CORRELATION_ID)
+
+    assert exc_info.value.code == "DUPLICATE_RAW_RECORD"
 
 
 def test_data_id_is_rfc8785_sha256_of_canonical_identity_and_decimal_scale():

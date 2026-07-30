@@ -32,6 +32,19 @@ def build_shadow_summary(
         raise ShadowSummaryError("SHADOW_SUMMARY_SLOT_INVALID")
     if len(rows) > 100:
         raise ShadowSummaryError("SHADOW_SUMMARY_LIMIT_EXCEEDED")
+    if len(rows) != 20:
+        raise ShadowSummaryError("SHADOW_SUMMARY_BATCH_SIZE_INVALID")
+    identities = {
+        (
+            row["equipment_id"],
+            row["meas_code"],
+            row["tb_device_id"],
+            row["cmms_asset_id"],
+        )
+        for row in rows
+    }
+    if len(identities) != 20:
+        raise ShadowSummaryError("SHADOW_SUMMARY_IDENTITY_DUPLICATE")
     mappings = sorted(
         (
             {
@@ -53,6 +66,8 @@ def build_shadow_summary(
         }
     )
     counts = Counter(str(row["status"]) for row in rows)
+    if sum(counts.values()) != 20:
+        raise ShadowSummaryError("SHADOW_SUMMARY_STATUS_TOTAL_INVALID")
     return {
         "tenant_alias": tenant_alias,
         "tenant_id": str(tenant_id),
