@@ -36,6 +36,8 @@ platform-integration closed-loop-worker \
   --role {alarm,work-order,status-poll} --owner OWNER [--once] [--now RFC3339]
 platform-integration closed-loop-summary --tenant-alias ALIAS --format json
 platform-integration provider-readiness --role {alarm,work-order,status-poll}
+platform-integration closed-loop-acceptance-verify --tenant-alias ALIAS \
+  [--expected-stage {CONSISTENT,ACTIVE,IN_PROGRESS,COMPLETE,CLEARED}] --format json
 ```
 
 - `migrate` 将本服务数据库升级到 Alembic head。
@@ -53,6 +55,14 @@ platform-integration provider-readiness --role {alarm,work-order,status-poll}
 `provider-readiness` 是无副作用的凭据健康检查：Alarm 角色使用服务 Token 核对
 ThingsBoard tenant，工单角色使用 CMMS Bearer 的 `/api/auth/me` 核对 company。凭据
 过期、身份漂移或配置缺失均返回非零状态，输出不包含凭据值。
+
+`closed-loop-acceptance-verify` 是隔离试点的只读验收命令。它从本服务数据库精确定位
+选定设备当前告警聚合，要求租户 outbox 已结清且无 dead-letter，再经稳定 API 读回
+ThingsBoard Alarm 和 CMMS 唯一 `external_ref` 工单并核对冻结身份、版本与状态。没有
+可验收告警或指定阶段尚未到达时以 `CLOSED_LOOP_ACCEPTANCE_NOT_READY` 非零退出；输出只含
+有界、无凭据的 canonical JSON 证据。未指定阶段时只检查一致性；`COMPLETE` 阶段要求
+CMMS 工单已完成但风险和 Alarm 仍保持活动，以证明工单完成本身不会清除风险；`CLEARED`
+阶段还要求连续健康计数至少为 2 且 ThingsBoard Alarm 已清除。
 
 `--now` 是隔离验收专用时钟：只允许与 `--once` 同时使用，并且必须显式设置
 `PLATFORM_INTEGRATION_ISOLATED_PILOT_MODE=1`。时间必须是严格 RFC3339，例如

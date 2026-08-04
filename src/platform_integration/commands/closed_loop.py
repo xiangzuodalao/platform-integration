@@ -18,6 +18,10 @@ from platform_integration.services.closed_loop_delivery import (
     StatusPollWorker,
     WorkOrderDeliveryWorker,
 )
+from platform_integration.services.closed_loop_acceptance import (
+    ClosedLoopAcceptanceStore,
+    ClosedLoopAcceptanceVerifier,
+)
 
 
 def _base_runtime(role: str | None = None) -> tuple[Settings, object, ClosedLoopDeliveryStore]:
@@ -180,3 +184,67 @@ async def _provider_readiness(role: str) -> None:
 
 def run_provider_readiness(role: str) -> None:
     asyncio.run(_provider_readiness(role))
+
+
+async def _closed_loop_acceptance_verify(
+    tenant_alias: str,
+    expected_stage: str,
+) -> None:
+    settings = Settings()
+    if (
+        not settings.closed_loop_enabled
+        or not settings.isolated_pilot_mode
+        or settings.database_url is None
+        or settings.tenant_alias is None
+        or settings.tenant_id is None
+        or settings.pilot_work_order_equipment_id is None
+        or settings.tb_base_url is None
+        or settings.tb_tenant_id is None
+        or settings.tb_credential_ref is None
+        or settings.cmms_base_url is None
+        or settings.cmms_company_id is None
+        or settings.cmms_credential_ref is None
+    ):
+        raise ShadowCommandError("CLOSED_LOOP_ACCEPTANCE_CONFIGURATION_INCOMPLETE")
+    if tenant_alias != settings.tenant_alias:
+        raise ShadowCommandError("CLOSED_LOOP_ACCEPTANCE_TENANT_MISMATCH")
+
+    sessions = create_async_sessionmaker(settings.database_url.get_secret_value())
+    credentials = EnvironmentCredentialProvider()
+    try:
+        async with (
+            httpx.AsyncClient(base_url=str(settings.tb_base_url)) as tb_http,
+            httpx.AsyncClient(base_url=str(settings.cmms_base_url)) as cmms_http,
+        ):
+            evidence = await ClosedLoopAcceptanceVerifier(
+                store=ClosedLoopAcceptanceStore(
+                    sessions=sessions,
+                    tenant_id=settings.tenant_id,
+                ),
+                thingsboard=ThingsBoardClient(
+                    http=tb_http,
+                    credentials=credentials,
+                    tb_credential_ref=settings.tb_credential_ref,
+                ),
+                cmms=CmmsClient(
+                    http=cmms_http,
+                    credentials=credentials,
+                    cmms_credential_ref=settings.cmms_credential_ref,
+                ),
+                tenant_id=settings.tenant_id,
+                tb_tenant_id=settings.tb_tenant_id,
+                cmms_company_id=settings.cmms_company_id,
+                tb_credential_ref=settings.tb_credential_ref,
+                cmms_credential_ref=settings.cmms_credential_ref,
+                equipment_id=settings.pilot_work_order_equipment_id,
+            ).verify(
+                tenant_alias=tenant_alias,
+                expected_stage=expected_stage,
+            )
+        print(rfc8785.dumps(evidence).decode())
+    finally:
+        await sessions.kw["bind"].dispose()
+
+
+def run_closed_loop_acceptance_verify(tenant_alias: str, expected_stage: str) -> None:
+    asyncio.run(_closed_loop_acceptance_verify(tenant_alias, expected_stage))

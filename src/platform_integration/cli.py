@@ -7,6 +7,7 @@ import uvicorn
 
 from platform_integration.app import create_app
 from platform_integration.commands.closed_loop import (
+    run_closed_loop_acceptance_verify,
     run_closed_loop_summary,
     run_closed_loop_worker,
     run_provider_readiness,
@@ -94,6 +95,17 @@ def build_parser() -> argparse.ArgumentParser:
         "provider-readiness", help="verify one role's external provider identity"
     )
     readiness.add_argument("--role", choices=("alarm", "work-order", "status-poll"), required=True)
+    acceptance = commands.add_parser(
+        "closed-loop-acceptance-verify",
+        help="read and verify one exact pilot closed-loop aggregate",
+    )
+    acceptance.add_argument("--tenant-alias", required=True)
+    acceptance.add_argument(
+        "--expected-stage",
+        choices=("CONSISTENT", "ACTIVE", "IN_PROGRESS", "COMPLETE", "CLEARED"),
+        default="CONSISTENT",
+    )
+    acceptance.add_argument("--format", choices=("json",), required=True)
     return parser
 
 
@@ -141,6 +153,11 @@ def main() -> None:
             run_closed_loop_summary(arguments.tenant_alias)
         elif arguments.command == "provider-readiness":
             run_provider_readiness(arguments.role)
+        elif arguments.command == "closed-loop-acceptance-verify":
+            run_closed_loop_acceptance_verify(
+                arguments.tenant_alias,
+                arguments.expected_stage,
+            )
     except Exception as exc:
         candidate = getattr(exc, "code", None)
         if type(candidate) is str and re.fullmatch(r"[A-Z][A-Z0-9_]{2,99}", candidate):

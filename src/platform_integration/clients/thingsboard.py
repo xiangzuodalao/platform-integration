@@ -304,6 +304,15 @@ class ThingsBoardClient:
         except ValueError:
             raise ThingsBoardClientError("THINGSBOARD_INVALID_ALARM_RESPONSE") from None
 
+    async def alarm_state(self, alarm_id: UUID | str) -> ThingsBoardAlarm:
+        """Read the complete provider state used by side-effect-free acceptance checks."""
+        canonical_id = str(_canonical_uuid(alarm_id))
+        response = await self._request("GET", f"/api/alarm/info/{canonical_id}")
+        try:
+            return _project_alarm(response.json(), for_update=True)
+        except ValueError:
+            raise ThingsBoardClientError("THINGSBOARD_INVALID_ALARM_RESPONSE") from None
+
     async def find_pdm_alarm(
         self,
         device_id: UUID | str,

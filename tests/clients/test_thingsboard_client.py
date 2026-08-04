@@ -145,6 +145,58 @@ async def test_alarm_baseline_uses_exact_filter_and_strict_count() -> None:
 
 
 @pytest.mark.asyncio
+async def test_alarm_state_reads_complete_acknowledgement_and_clear_state() -> None:
+    """Acceptance must use one read-only Alarm API and reject an incomplete projection."""
+    alarm_id = "00000000-0000-4000-8000-000000000301"
+    captured = None
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal captured
+        captured = request
+        return httpx.Response(
+            200,
+            json={
+                "id": {"id": alarm_id, "entityType": "ALARM"},
+                "tenantId": {"id": TENANT_ID, "entityType": "TENANT"},
+                "originator": {"id": DEVICE_ID, "entityType": "DEVICE"},
+                "type": "PDM_FORECAST_RISK",
+                "severity": "WARNING",
+                "status": "CLEARED_ACK",
+                "acknowledged": True,
+                "cleared": True,
+                "startTs": 1,
+                "endTs": 2,
+                "ackTs": 3,
+                "clearTs": 4,
+                "assignTs": 0,
+                "propagate": False,
+                "propagateToOwner": False,
+                "propagateToTenant": False,
+                "propagateRelationTypes": [],
+                "details": {"maintenance_alert_version": 8},
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://tb.invalid",
+    ) as http:
+        result = await ThingsBoardClient(
+            http=http,
+            credentials=provider(),
+            tb_credential_ref="TB_TEST_CREDENTIAL",
+        ).alarm_state(alarm_id)
+
+    assert result.update_fields["acknowledged"] is True
+    assert result.update_fields["cleared"] is True
+    assert result.status == "CLEARED_ACK"
+    assert captured is not None
+    assert captured.method == "GET"
+    assert captured.url.path == f"/api/alarm/info/{alarm_id}"
+    assert "X-Authorization" not in captured.headers
+
+
+@pytest.mark.asyncio
 async def test_alarm_reconciliation_matches_the_full_episode_identity_only() -> None:
     """A cleared or old episode with the same risk key must not capture a new alert delivery."""
     risk_key = "a" * 64

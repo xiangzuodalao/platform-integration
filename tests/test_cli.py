@@ -233,6 +233,77 @@ def test_closed_loop_role_parser_requires_one_role_and_explicit_owner():
     assert readiness.role == "alarm"
 
 
+def test_closed_loop_acceptance_parser_is_exact_read_only_and_stage_bounded():
+    """Acceptance must target one alias and cannot imply a write or an unbounded query."""
+    cli = require_module("platform_integration.cli", "closed-loop acceptance CLI")
+    parser = cli.build_parser()
+
+    consistent = parser.parse_args(
+        [
+            "closed-loop-acceptance-verify",
+            "--tenant-alias",
+            "ifactory-pilot",
+            "--format",
+            "json",
+        ]
+    )
+    cleared = parser.parse_args(
+        [
+            "closed-loop-acceptance-verify",
+            "--tenant-alias",
+            "ifactory-pilot",
+            "--expected-stage",
+            "CLEARED",
+            "--format",
+            "json",
+        ]
+    )
+
+    assert consistent.expected_stage == "CONSISTENT"
+    assert (cleared.tenant_alias, cleared.expected_stage, cleared.format) == (
+        "ifactory-pilot",
+        "CLEARED",
+        "json",
+    )
+
+
+def test_closed_loop_acceptance_not_ready_is_nonzero_and_never_echoes_details(
+    monkeypatch,
+    capsys,
+):
+    """A missing current alert needs a machine-readable failure without DB/provider details."""
+    cli = require_module("platform_integration.cli", "closed-loop acceptance CLI")
+    secret = "acceptance-cli-secret-canary"
+
+    class NotReady(RuntimeError):
+        code = "CLOSED_LOOP_ACCEPTANCE_NOT_READY"
+
+    def fail(*_):
+        raise NotReady(secret)
+
+    monkeypatch.setattr(cli, "run_closed_loop_acceptance_verify", fail)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "platform-integration",
+            "closed-loop-acceptance-verify",
+            "--tenant-alias",
+            "ifactory-pilot",
+            "--format",
+            "json",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+
+    captured = capsys.readouterr()
+    assert exc_info.value.code == 2
+    assert captured.err == "error: CLOSED_LOOP_ACCEPTANCE_NOT_READY\n"
+    assert secret not in captured.out + captured.err
+
+
 def test_scheduler_now_requires_once_and_explicit_isolated_pilot_mode(monkeypatch, capsys):
     """Allowing clock injection in production could backfill or overwrite a real slot."""
     cli = require_module("platform_integration.cli", "isolated scheduler clock gate")
