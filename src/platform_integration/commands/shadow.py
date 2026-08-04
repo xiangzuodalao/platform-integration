@@ -117,7 +117,15 @@ def _install_stop_handlers(stopped: asyncio.Event) -> None:
 async def _scheduler(*, once: bool, now: datetime | None) -> None:
     settings, sessions = _database_settings()
     assert settings.tenant_id is not None
-    store = ShadowExecutionStore(sessions=sessions, tenant_id=settings.tenant_id)
+    if settings.closed_loop_enabled and settings.pilot_work_order_equipment_id is None:
+        await sessions.kw["bind"].dispose()
+        raise ShadowCommandError("CLOSED_LOOP_PILOT_EQUIPMENT_REQUIRED")
+    store = ShadowExecutionStore(
+        sessions=sessions,
+        tenant_id=settings.tenant_id,
+        closed_loop_enabled=settings.closed_loop_enabled,
+        pilot_work_order_equipment_id=settings.pilot_work_order_equipment_id,
+    )
     scheduler = Scheduler(store=store, active_bindings=store.active_bindings)
     stopped = asyncio.Event()
     _install_stop_handlers(stopped)
@@ -158,6 +166,8 @@ def _prediction_runtime(
     *,
     now: datetime | None = None,
 ) -> _PredictionRuntime:
+    if settings.closed_loop_enabled and settings.pilot_work_order_equipment_id is None:
+        raise ShadowCommandError("CLOSED_LOOP_PILOT_EQUIPMENT_REQUIRED")
     if (
         settings.tenant_id is None
         or settings.tb_base_url is None
@@ -169,7 +179,12 @@ def _prediction_runtime(
     credentials = EnvironmentCredentialProvider()
     tb_http = httpx.AsyncClient(base_url=str(settings.tb_base_url))
     pdm_http = httpx.AsyncClient(base_url=str(settings.pdm_base_url))
-    store = ShadowExecutionStore(sessions=sessions, tenant_id=settings.tenant_id)
+    store = ShadowExecutionStore(
+        sessions=sessions,
+        tenant_id=settings.tenant_id,
+        closed_loop_enabled=settings.closed_loop_enabled,
+        pilot_work_order_equipment_id=settings.pilot_work_order_equipment_id,
+    )
     clock = (lambda: datetime.now(UTC)) if now is None else (lambda: now)
     processor = PredictionProcessor(
         store=store,
@@ -204,6 +219,12 @@ def _prediction_runtime(
 
 async def _prediction_worker(*, once: bool, now: datetime | None = None) -> None:
     settings, sessions = _database_settings()
+    if (
+        getattr(settings, "closed_loop_enabled", False)
+        and getattr(settings, "pilot_work_order_equipment_id", None) is None
+    ):
+        await sessions.kw["bind"].dispose()
+        raise ShadowCommandError("CLOSED_LOOP_PILOT_EQUIPMENT_REQUIRED")
     runtime = _prediction_runtime(settings, sessions, now=now)
     stopped = asyncio.Event()
     _install_stop_handlers(stopped)

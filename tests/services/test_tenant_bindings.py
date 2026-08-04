@@ -17,7 +17,7 @@ from platform_integration.services.tenant_bindings import (
 
 
 class FakeThingsBoard:
-    tenant_id = ISOLATED_TENANT_ID
+    tenant_id = UUID("30000000-0000-4000-8000-000000000001")
 
     def __init__(self, *, alarm_device: UUID | None = None) -> None:
         self.alarm_device = alarm_device
@@ -46,7 +46,7 @@ def config() -> TenantBindingConfig:
     return TenantBindingConfig(
         tenant_id=ISOLATED_TENANT_ID,
         alias=PILOT_ALIAS,
-        tb_tenant_id=ISOLATED_TENANT_ID,
+        tb_tenant_id=UUID("30000000-0000-4000-8000-000000000001"),
         cmms_company_id=201,
         pdm_credential_ref="PDM_PILOT_CREDENTIAL",
         tb_credential_ref="TB_PILOT_CREDENTIAL",
@@ -89,7 +89,7 @@ async def test_readiness_checks_exact_twenty_devices_and_zero_isolation_baseline
 
     snapshot = await service.validate_readiness(targets)
 
-    assert snapshot.tb_tenant_id == ISOLATED_TENANT_ID
+    assert snapshot.tb_tenant_id == UUID("30000000-0000-4000-8000-000000000001")
     assert snapshot.cmms_company_id == 201
     assert tb.alarm_checks == list(targets)
 
@@ -101,7 +101,7 @@ async def test_readiness_checks_exact_twenty_devices_and_zero_isolation_baseline
         await TenantBindingsService(config(), tb=alarm_tb, cmms=cmms).validate_readiness(targets)
     assert alarm_error.value.code == "ISOLATION_BASELINE_NOT_CLEAN"
     assert alarm_error.value.details == {
-        "tb_tenant_id": str(ISOLATED_TENANT_ID),
+        "tb_tenant_id": "30000000-0000-4000-8000-000000000001",
         "active_pdm_alarm_count": 1,
         "cmms_company_id": 201,
         "work_order_count": 0,

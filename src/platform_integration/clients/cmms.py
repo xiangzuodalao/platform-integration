@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from uuid import UUID
 
 import httpx
@@ -9,6 +10,7 @@ from pydantic import ValidationError
 from platform_integration.contracts.cmms import (
     CmmsAsset,
     CmmsAssetCreate,
+    CmmsWorkOrder,
     normalize_cmms_uuid,
 )
 from platform_integration.credentials import (
@@ -24,6 +26,10 @@ IDEMPOTENCY_KEY_RE = re.compile(
     r"^pilot-asset:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{12}$"
 )
+WORK_ORDER_IDEMPOTENCY_KEY_RE = re.compile(
+    r"^wo:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 
 
 class CmmsClientError(RuntimeError):
@@ -34,6 +40,7 @@ class CmmsClientError(RuntimeError):
 
 def _scrub_request(request: httpx.Request) -> None:
     request.headers.pop("x-api-key", None)
+    request.headers.pop("Authorization", None)
 
 
 class CmmsClient:
@@ -52,34 +59,39 @@ class CmmsClient:
         self._credentials = credentials
         self._credential_ref = cmms_credential_ref
 
-    def _api_key(self) -> str:
+    def _authorization_headers(self) -> dict[str, str]:
         try:
             credential = self._credentials.get(self._credential_ref)
         except CredentialResolutionError:
             raise CmmsClientError("CMMS_CREDENTIAL_UNAVAILABLE") from None
-        if credential.kind != "cmms_api_key":
+        if credential.kind not in {"cmms_api_key", "cmms_bearer"}:
             del credential
             raise CmmsClientError("CMMS_CREDENTIAL_KIND_INVALID") from None
-        api_key = credential.value.get_secret_value()
+        secret = credential.value.get_secret_value()
+        kind = credential.kind
         del credential
-        return api_key
+        if kind == "cmms_api_key":
+            return {"x-api-key": secret}
+        return {"Authorization": f"Bearer {secret}"}
 
     async def _request(
         self,
         method: str,
         path: str,
         *,
+        params: Mapping[str, object] | None = None,
         json: dict[str, object] | None = None,
         headers: dict[str, str] | None = None,
         write: bool = False,
     ) -> httpx.Response:
-        api_key = self._api_key()
-        request_headers = {**(headers or {}), "x-api-key": api_key}
+        authorization = self._authorization_headers()
+        request_headers = {**(headers or {}), **authorization}
         failure_code: str | None = None
         try:
             response = await self._http.request(
                 method,
                 path,
+                params=params,
                 json=json,
                 headers=request_headers,
                 timeout=CMMS_TIMEOUT_SECONDS,
@@ -94,7 +106,7 @@ class CmmsClient:
                 pass
             failure_code = "CMMS_UNAVAILABLE"
         finally:
-            del api_key, request_headers
+            del authorization, request_headers
         if failure_code is not None:
             raise CmmsClientError(failure_code) from None
         try:
@@ -175,6 +187,56 @@ class CmmsClient:
         if response.status_code != 201:
             raise CmmsClientError("CMMS_REQUEST_FAILED")
         return self._project_asset(response)
+
+    async def find_work_order_by_external_ref(
+        self,
+        external_ref: UUID | str,
+    ) -> CmmsWorkOrder | None:
+        canonical_ref = str(normalize_cmms_uuid(external_ref))
+        response = await self._request(
+            "GET",
+            "/api/work-orders/by-external-ref",
+            params={"source": "PDM_FORECAST", "ref": canonical_ref},
+        )
+        if response.status_code == 404:
+            return None
+        if response.status_code != 200:
+            raise CmmsClientError("CMMS_REQUEST_FAILED")
+        return self._project_work_order(response)
+
+    async def create_work_order(
+        self,
+        request: dict[str, object],
+        *,
+        idempotency_key: str,
+    ) -> CmmsWorkOrder:
+        if (
+            type(idempotency_key) is not str
+            or WORK_ORDER_IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key) is None
+        ):
+            raise CmmsClientError("IDEMPOTENCY_KEY_INVALID")
+        response = await self._request(
+            "POST",
+            "/api/work-orders",
+            headers={"Idempotency-Key": idempotency_key},
+            json=request,
+            write=True,
+        )
+        if response.status_code == 409:
+            raise CmmsClientError("IDEMPOTENCY_CONFLICT")
+        if response.status_code != 201:
+            raise CmmsClientError("CMMS_REQUEST_FAILED")
+        return self._project_work_order(response)
+
+    @staticmethod
+    def _project_work_order(response: httpx.Response) -> CmmsWorkOrder:
+        try:
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("object response required")
+            return CmmsWorkOrder.from_provider(payload)
+        except (ValidationError, ValueError):
+            raise CmmsClientError("CMMS_INVALID_WORK_ORDER_RESPONSE") from None
 
     @staticmethod
     def _project_asset(response: httpx.Response) -> CmmsAsset:

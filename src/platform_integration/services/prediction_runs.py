@@ -55,9 +55,18 @@ class ClaimedPrediction:
 
 
 class ShadowExecutionStore:
-    def __init__(self, *, sessions, tenant_id: UUID) -> None:
+    def __init__(
+        self,
+        *,
+        sessions,
+        tenant_id: UUID,
+        closed_loop_enabled: bool = False,
+        pilot_work_order_equipment_id: UUID | None = None,
+    ) -> None:
         self._sessions = sessions
         self._tenant_id = tenant_id
+        self._closed_loop_enabled = closed_loop_enabled
+        self._pilot_work_order_equipment_id = pilot_work_order_equipment_id
 
     async def active_bindings(self) -> list[PredictionTarget]:
         async with self._sessions() as session:
@@ -408,11 +417,26 @@ class ShadowExecutionStore:
                 active=state.internal_active,
             )
             next_state = advance_risk_state(current, risky=risk.risky, successful=True)
+            was_active = state.internal_active
             state.consecutive_risk_count = next_state.consecutive_risk_count
             state.consecutive_healthy_count = next_state.consecutive_healthy_count
             state.internal_active = next_state.active
             state.last_prediction_run_id = run.run_id
             state.version += 1
+            if self._closed_loop_enabled:
+                from platform_integration.services.closed_loop import ClosedLoopTransitionService
+
+                await ClosedLoopTransitionService(
+                    pilot_work_order_equipment_id=self._pilot_work_order_equipment_id
+                ).apply(
+                    session,
+                    run=run,
+                    state=state,
+                    binding=claim.binding,
+                    risk=risk,
+                    was_active=was_active,
+                    now=run.completed_at,
+                )
 
     @staticmethod
     def _bounded_quality_summary(summary: object) -> dict[str, int]:

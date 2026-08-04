@@ -204,6 +204,35 @@ def test_shadow_role_parsers_expose_only_bounded_explicit_operations():
     assert (summary.tenant_alias, summary.format) == ("ifactory-pilot", "json")
 
 
+def test_closed_loop_role_parser_requires_one_role_and_explicit_owner():
+    """An implicit shared worker role would unnecessarily combine external credentials."""
+    cli = require_module("platform_integration.cli", "closed-loop worker CLI roles")
+    parser = cli.build_parser()
+
+    worker = parser.parse_args(
+        [
+            "closed-loop-worker",
+            "--role",
+            "work-order",
+            "--owner",
+            "pilot-work-order-1",
+            "--once",
+        ]
+    )
+    summary = parser.parse_args(
+        ["closed-loop-summary", "--tenant-alias", "ifactory-pilot", "--format", "json"]
+    )
+
+    assert (worker.role, worker.owner, worker.once) == (
+        "work-order",
+        "pilot-work-order-1",
+        True,
+    )
+    assert (summary.tenant_alias, summary.format) == ("ifactory-pilot", "json")
+    readiness = parser.parse_args(["provider-readiness", "--role", "alarm"])
+    assert readiness.role == "alarm"
+
+
 def test_scheduler_now_requires_once_and_explicit_isolated_pilot_mode(monkeypatch, capsys):
     """Allowing clock injection in production could backfill or overwrite a real slot."""
     cli = require_module("platform_integration.cli", "isolated scheduler clock gate")

@@ -6,6 +6,11 @@ from datetime import datetime
 import uvicorn
 
 from platform_integration.app import create_app
+from platform_integration.commands.closed_loop import (
+    run_closed_loop_summary,
+    run_closed_loop_worker,
+    run_provider_readiness,
+)
 from platform_integration.commands.provision import (
     run_provision_apply,
     run_provision_plan,
@@ -71,6 +76,24 @@ def build_parser() -> argparse.ArgumentParser:
     summary.add_argument("--tenant-alias", required=True)
     summary.add_argument("--scheduled-at", required=True)
     summary.add_argument("--format", choices=("json",), required=True)
+    closed_loop_worker = commands.add_parser(
+        "closed-loop-worker", help="deliver one bounded closed-loop role"
+    )
+    closed_loop_worker.add_argument(
+        "--role", choices=("alarm", "work-order", "status-poll"), required=True
+    )
+    closed_loop_worker.add_argument("--owner", required=True)
+    closed_loop_worker.add_argument("--once", action="store_true")
+    closed_loop_worker.add_argument("--now")
+    closed_loop_summary = commands.add_parser(
+        "closed-loop-summary", help="print bounded closed-loop evidence"
+    )
+    closed_loop_summary.add_argument("--tenant-alias", required=True)
+    closed_loop_summary.add_argument("--format", choices=("json",), required=True)
+    readiness = commands.add_parser(
+        "provider-readiness", help="verify one role's external provider identity"
+    )
+    readiness.add_argument("--role", choices=("alarm", "work-order", "status-poll"), required=True)
     return parser
 
 
@@ -106,6 +129,18 @@ def main() -> None:
                 arguments.tenant_alias,
                 parse_rfc3339(arguments.scheduled_at),
             )
+        elif arguments.command == "closed-loop-worker":
+            now = _isolated_once_now(arguments)
+            run_closed_loop_worker(
+                role=arguments.role,
+                owner=arguments.owner,
+                once=arguments.once,
+                now=now,
+            )
+        elif arguments.command == "closed-loop-summary":
+            run_closed_loop_summary(arguments.tenant_alias)
+        elif arguments.command == "provider-readiness":
+            run_provider_readiness(arguments.role)
     except Exception as exc:
         candidate = getattr(exc, "code", None)
         if type(candidate) is str and re.fullmatch(r"[A-Z][A-Z0-9_]{2,99}", candidate):

@@ -368,3 +368,97 @@ async def test_cmms_rejects_company_identity_above_signed_bigint() -> None:
 
     assert exc_info.value.code == "CMMS_INVALID_IDENTITY_RESPONSE"
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_cmms_bearer_uses_authorization_header_and_rotates_without_api_key() -> None:
+    """The license-free isolated pilot must authenticate with its short-lived CMMS JWT."""
+    clients = require_module("platform_integration.clients.cmms", "CMMS bearer credentials")
+    tokens = iter(("first-bearer", "second-bearer"))
+    provider = SimpleNamespace(
+        get=lambda _: SimpleNamespace(kind="cmms_bearer", value=SecretStr(next(tokens)))
+    )
+    seen = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(
+            (
+                request.headers.get("Authorization"),
+                request.headers.get("x-api-key"),
+            )
+        )
+        return httpx.Response(200, json={"companyId": 7001})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://cmms.invalid"
+    ) as http:
+        client = cmms_client(clients, http, provider)
+        assert await client.authenticated_company_id() == 7001
+        assert await client.authenticated_company_id() == 7001
+
+    assert seen == [("Bearer first-bearer", None), ("Bearer second-bearer", None)]
+
+
+@pytest.mark.asyncio
+async def test_work_order_lookup_and_create_use_exact_external_identity_contract() -> None:
+    """Changing the lookup query or create key would break response-loss reconciliation."""
+    clients = require_module("platform_integration.clients.cmms", "CMMS work-order contract")
+    alert_id = "00000000-0000-4000-8000-000000000301"
+    correlation_id = "00000000-0000-4000-8000-000000000302"
+    alarm_id = "00000000-0000-4000-8000-000000000303"
+    equipment_id = "00000000-0000-4000-8000-000000000304"
+    seen = []
+    response = {
+        "id": 42,
+        "title": "Predictive maintenance risk",
+        "status": "OPEN",
+        "updatedAt": "2026-08-04T06:00:00Z",
+        "asset": {"id": 701},
+        "external_source": "PDM_FORECAST",
+        "external_ref": alert_id,
+        "correlation_id": correlation_id,
+        "equipment_id": equipment_id,
+        "tb_alarm_id": alarm_id,
+        "model_profile_id": "pilot-profile",
+        "model_info_id": "pilot-model",
+        "policy_version": "pilot-policy-v1",
+        "event_version": 0,
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, dict(request.url.params)))
+        if request.method == "GET":
+            return httpx.Response(404, json={"code": "WORK_ORDER_NOT_FOUND"})
+        assert request.headers["Idempotency-Key"] == f"wo:{alert_id}"
+        return httpx.Response(201, json=response)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://cmms.invalid"
+    ) as http:
+        client = cmms_client(clients, http)
+        assert await client.find_work_order_by_external_ref(alert_id) is None
+        created = await client.create_work_order(
+            {
+                "asset": {"id": 701},
+                "external_ref": alert_id,
+                "correlation_id": correlation_id,
+                "equipment_id": equipment_id,
+                "tb_alarm_id": alarm_id,
+                "model_profile_id": "pilot-profile",
+                "model_info_id": "pilot-model",
+                "policy_version": "pilot-policy-v1",
+            },
+            idempotency_key=f"wo:{alert_id}",
+        )
+
+    assert created.id == 42
+    assert created.event_version == 0
+    assert created.updated_at.isoformat() == "2026-08-04T06:00:00+00:00"
+    assert seen == [
+        (
+            "GET",
+            "/api/work-orders/by-external-ref",
+            {"source": "PDM_FORECAST", "ref": alert_id},
+        ),
+        ("POST", "/api/work-orders", {}),
+    ]

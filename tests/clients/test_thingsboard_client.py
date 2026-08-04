@@ -145,6 +145,166 @@ async def test_alarm_baseline_uses_exact_filter_and_strict_count() -> None:
 
 
 @pytest.mark.asyncio
+async def test_alarm_reconciliation_matches_the_full_episode_identity_only() -> None:
+    """A cleared or old episode with the same risk key must not capture a new alert delivery."""
+    risk_key = "a" * 64
+    current_alert = "00000000-0000-4000-8000-000000000401"
+    equipment_id = "00000000-0000-4000-8000-000000000201"
+    captured = None
+
+    def alarm(alarm_id, alert_id):
+        return {
+            "id": {"id": alarm_id, "entityType": "ALARM"},
+            "tenantId": {"id": TENANT_ID, "entityType": "TENANT"},
+            "originator": {"id": DEVICE_ID, "entityType": "DEVICE"},
+            "type": "PDM_FORECAST_RISK",
+            "severity": "WARNING",
+            "status": "ACTIVE_ACK",
+            "acknowledged": True,
+            "cleared": False,
+            "startTs": 1,
+            "endTs": 2,
+            "ackTs": 3,
+            "clearTs": 0,
+            "assignTs": 0,
+            "propagate": False,
+            "propagateToOwner": False,
+            "propagateToTenant": False,
+            "propagateRelationTypes": [],
+            "details": {
+                "risk_key": risk_key,
+                "alert_id": alert_id,
+                "equipment_id": equipment_id,
+                "meas_code": "vibration_rms",
+            },
+        }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal captured
+        captured = request
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    alarm(
+                        "00000000-0000-4000-8000-000000000501",
+                        "00000000-0000-4000-8000-000000000402",
+                    ),
+                    alarm("00000000-0000-4000-8000-000000000502", current_alert),
+                ],
+                "hasNext": False,
+                "totalElements": 2,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://tb.invalid"
+    ) as http:
+        client = ThingsBoardClient(
+            http=http,
+            credentials=provider(),
+            tb_credential_ref="TB_TEST_CREDENTIAL",
+        )
+        result = await client.find_pdm_alarm(
+            DEVICE_ID,
+            risk_key=risk_key,
+            alert_id=current_alert,
+            equipment_id=equipment_id,
+            meas_code="vibration_rms",
+        )
+
+    assert result is not None
+    assert str(result.alarm_id) == "00000000-0000-4000-8000-000000000502"
+    assert captured is not None
+    assert dict(captured.url.params) == {
+        "pageSize": "100",
+        "page": "0",
+        "statusList": "ACTIVE",
+        "typeList": "PDM_FORECAST_RISK",
+    }
+
+
+@pytest.mark.asyncio
+async def test_alarm_update_preserves_acknowledgement_and_provider_timestamps() -> None:
+    """A details refresh must not turn ACTIVE_ACK back into ACTIVE_UNACK."""
+    alarm_id = "00000000-0000-4000-8000-000000000502"
+    alert_id = "00000000-0000-4000-8000-000000000401"
+    equipment_id = "00000000-0000-4000-8000-000000000201"
+    risk_key = "b" * 64
+    posted = None
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal posted
+        if request.method == "POST":
+            posted = json.loads(request.content)
+            return httpx.Response(200, json={"id": {"id": alarm_id}})
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": {"id": alarm_id},
+                        "tenantId": {"id": TENANT_ID},
+                        "originator": {"id": DEVICE_ID},
+                        "type": "PDM_FORECAST_RISK",
+                        "severity": "WARNING",
+                        "status": "ACTIVE_ACK",
+                        "acknowledged": True,
+                        "cleared": False,
+                        "startTs": 100,
+                        "endTs": 200,
+                        "ackTs": 150,
+                        "clearTs": 0,
+                        "assignTs": 0,
+                        "propagate": False,
+                        "propagateToOwner": False,
+                        "propagateToTenant": False,
+                        "propagateRelationTypes": [],
+                        "details": {
+                            "risk_key": risk_key,
+                            "alert_id": alert_id,
+                            "equipment_id": equipment_id,
+                            "meas_code": "vibration_rms",
+                        },
+                    }
+                ],
+                "hasNext": False,
+                "totalElements": 1,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://tb.invalid"
+    ) as http:
+        client = ThingsBoardClient(
+            http=http,
+            credentials=provider(values=("read-token", "write-token")),
+            tb_credential_ref="TB_TEST_CREDENTIAL",
+        )
+        existing = await client.find_pdm_alarm(
+            DEVICE_ID,
+            risk_key=risk_key,
+            alert_id=alert_id,
+            equipment_id=equipment_id,
+            meas_code="vibration_rms",
+        )
+        assert existing is not None
+        await client.upsert_pdm_alarm(
+            device_id=DEVICE_ID,
+            details={**existing.details, "maintenance_alert_version": 2},
+            existing_alarm=existing,
+        )
+
+    assert posted is not None
+    assert posted["acknowledged"] is True
+    assert posted["ackTs"] == 150
+    assert posted["cleared"] is False
+    assert posted["startTs"] == 100
+    assert posted["details"]["maintenance_alert_version"] == 2
+    assert "status" not in posted
+
+
+@pytest.mark.asyncio
 async def test_historical_telemetry_uses_the_exact_half_open_bucket_query() -> None:
     """Changing aggregation, ordering, or the inclusive provider end corrupts PDM input."""
     captured: httpx.Request | None = None

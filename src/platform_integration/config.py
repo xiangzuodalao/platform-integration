@@ -1,7 +1,6 @@
 from uuid import UUID
 
-from pydantic import HttpUrl
-from pydantic import SecretStr
+from pydantic import Field, HttpUrl, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from platform_integration.credentials import CredentialReference
@@ -23,3 +22,18 @@ class Settings(BaseSettings):
     tb_credential_ref: CredentialReference | None = None
     cmms_credential_ref: CredentialReference | None = None
     cmms_webhook_secret_ref: CredentialReference | None = None
+    closed_loop_enabled: bool = False
+    approver_tb_user_id: UUID | None = None
+    pilot_work_order_equipment_id: UUID | None = None
+    feedback_poll_seconds: int = Field(default=300, ge=30, le=3600)
+
+    @field_validator(
+        "tb_tenant_id",
+        "cmms_company_id",
+        "approver_tb_user_id",
+        "pilot_work_order_equipment_id",
+        mode="before",
+    )
+    @classmethod
+    def empty_optional_identity_is_unset(cls, value: object) -> object:
+        return None if value == "" else value

@@ -72,6 +72,35 @@ def test_isolated_provisioning_settings_are_external_and_exact():
     assert str(settings.cmms_base_url) == "https://cmms.invalid/"
 
 
+def test_closed_loop_is_off_by_default_and_polling_is_bounded():
+    """An accidental default-on write path or tight polling loop would break Phase 2 safety."""
+    config = require_module("platform_integration.config", "closed-loop settings")
+
+    assert config.Settings().closed_loop_enabled is False
+    assert config.Settings().feedback_poll_seconds == 300
+    with pytest.raises(ValidationError):
+        config.Settings(feedback_poll_seconds=29)
+
+
+def test_optional_bootstrap_identities_accept_empty_environment_values(monkeypatch):
+    """Migrate and provision must parse before runtime writes back discovered typed identities."""
+    config = require_module("platform_integration.config", "bootstrap optional identities")
+    for name in (
+        "TB_TENANT_ID",
+        "CMMS_COMPANY_ID",
+        "APPROVER_TB_USER_ID",
+        "PILOT_WORK_ORDER_EQUIPMENT_ID",
+    ):
+        monkeypatch.setenv(f"PLATFORM_INTEGRATION_{name}", "")
+
+    settings = config.Settings()
+
+    assert settings.tb_tenant_id is None
+    assert settings.cmms_company_id is None
+    assert settings.approver_tb_user_id is None
+    assert settings.pilot_work_order_equipment_id is None
+
+
 @pytest.mark.parametrize(
     "invalid",
     [

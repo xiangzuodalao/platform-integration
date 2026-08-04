@@ -32,6 +32,10 @@ platform-integration scheduler [--once] [--now RFC3339]
 platform-integration prediction-worker [--once] [--now RFC3339]
 platform-integration shadow-summary --tenant-alias ALIAS \
   --scheduled-at RFC3339 --format json
+platform-integration closed-loop-worker \
+  --role {alarm,work-order,status-poll} --owner OWNER [--once] [--now RFC3339]
+platform-integration closed-loop-summary --tenant-alias ALIAS --format json
+platform-integration provider-readiness --role {alarm,work-order,status-poll}
 ```
 
 - `migrate` 将本服务数据库升级到 Alembic head。
@@ -39,7 +43,16 @@ platform-integration shadow-summary --tenant-alias ALIAS \
 - `provision-plan`、`provision-apply` 和 `provision-verify` 提供计划、精确确认执行及
   持久回执流程；所有外部写入都通过稳定 API。
 - `scheduler` 创建预测时隙，`prediction-worker` 领取并完成合资格运行，
-  `shadow-summary` 只读输出有界验收证据。
+`shadow-summary` 只读输出有界验收证据。
+
+闭环默认由 `PLATFORM_INTEGRATION_CLOSED_LOOP_ENABLED=false` 禁用。隔离试点启用后，
+`closed-loop-worker` 按角色交付 ThingsBoard Alarm、CMMS 工单创建或 CMMS 状态轮询；每个
+进程只需注入该角色使用的凭据。`closed-loop-summary` 只输出按状态聚合的计数，不输出
+凭据、原始遥测、完整预测数组或工单正文。
+
+`provider-readiness` 是无副作用的凭据健康检查：Alarm 角色使用服务 Token 核对
+ThingsBoard tenant，工单角色使用 CMMS Bearer 的 `/api/auth/me` 核对 company。凭据
+过期、身份漂移或配置缺失均返回非零状态，输出不包含凭据值。
 
 `--now` 是隔离验收专用时钟：只允许与 `--once` 同时使用，并且必须显式设置
 `PLATFORM_INTEGRATION_ISOLATED_PILOT_MODE=1`。时间必须是严格 RFC3339，例如

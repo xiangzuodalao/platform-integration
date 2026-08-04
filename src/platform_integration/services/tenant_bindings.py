@@ -84,11 +84,7 @@ class TenantBindingsService:
         tb: ThingsBoardReadiness,
         cmms: CmmsReadiness,
     ) -> None:
-        if (
-            config.alias != PILOT_ALIAS
-            or config.tenant_id != ISOLATED_TENANT_ID
-            or config.tb_tenant_id != ISOLATED_TENANT_ID
-        ):
+        if config.alias != PILOT_ALIAS or config.tenant_id != ISOLATED_TENANT_ID:
             raise TenantBindingError("PILOT_ALIAS_TENANT_MISMATCH")
         if type(config.cmms_company_id) is not int or config.cmms_company_id <= 0:
             raise TenantBindingError("CMMS_COMPANY_ID_INVALID")

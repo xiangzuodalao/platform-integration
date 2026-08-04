@@ -91,7 +91,7 @@ def test_runtime_image_can_migrate_temporary_postgres_to_alembic_head():
             capture_output=True,
             text=True,
         ).stdout.strip()
-        assert revision == "0003_internal_risk_state"
+        assert revision == "0004_closed_loop_pilot"
     finally:
         subprocess.run(["docker", "rm", "--force", database], check=False, capture_output=True)
         subprocess.run(["docker", "network", "rm", network], check=False, capture_output=True)

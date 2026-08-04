@@ -40,8 +40,18 @@ class CmmsApiKeyCredential(BaseModel):
     value: SecretStr = Field(min_length=1)
 
 
+class CmmsBearerCredential(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    kind: Literal["cmms_bearer"]
+    value: SecretStr = Field(min_length=1)
+
+
 CredentialEnvelope: TypeAlias = (
-    OpaqueBearerCredential | ThingsBoardBearerCredential | CmmsApiKeyCredential
+    OpaqueBearerCredential
+    | ThingsBoardBearerCredential
+    | CmmsApiKeyCredential
+    | CmmsBearerCredential
 )
 
 
@@ -64,6 +74,7 @@ class EnvironmentCredentialProvider:
                 "opaque_bearer": OpaqueBearerCredential,
                 "thingsboard_bearer": ThingsBoardBearerCredential,
                 "cmms_api_key": CmmsApiKeyCredential,
+                "cmms_bearer": CmmsBearerCredential,
             }.get(kind)
             if model is None:
                 raise ValueError("unsupported credential kind")

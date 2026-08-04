@@ -20,6 +20,13 @@ EXPECTED_TABLES = {
     "risk_evaluation_state",
     "audit_event",
 }
+CLOSED_LOOP_TABLES = {
+    "maintenance_alert",
+    "alarm_projection",
+    "alert_action",
+    "maintenance_work_order",
+    "outbox_event",
+}
 MEASUREMENT_COLUMNS = {
     "tenant_id",
     "equipment_id",
@@ -339,3 +346,25 @@ def test_internal_risk_state_migration_round_trip(postgres_url):
         assert not columns["internal_active"]["nullable"]
     finally:
         engine.dispose()
+
+
+def test_closed_loop_migration_round_trip(postgres_url):
+    """The pilot tables must be independently rollback-safe without removing Phase 2 state."""
+    config = _alembic_config(postgres_url)
+    command.upgrade(config, "head")
+    engine = create_engine(postgres_url)
+    try:
+        assert CLOSED_LOOP_TABLES <= set(inspect(engine).get_table_names())
+    finally:
+        engine.dispose()
+
+    command.downgrade(config, "0003_internal_risk_state")
+    engine = create_engine(postgres_url)
+    try:
+        tables = set(inspect(engine).get_table_names())
+        assert CLOSED_LOOP_TABLES.isdisjoint(tables)
+        assert EXPECTED_TABLES <= tables
+    finally:
+        engine.dispose()
+
+    command.upgrade(config, "head")
