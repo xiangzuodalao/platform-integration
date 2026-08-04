@@ -119,8 +119,8 @@ async def test_readiness_checks_exact_twenty_devices_and_zero_isolation_baseline
     assert "reset" not in str(work_order_error.value).lower()
 
 
-def test_expected_devices_are_the_exact_twenty_case_sensitive_simulator_targets() -> None:
-    """Accepting labels, case drift, or a partial device set could provision the wrong entity."""
+def test_expected_devices_are_a_strict_case_sensitive_allowlist() -> None:
+    """Pilot targets stay exact while unrelated tenant devices remain outside the closed loop."""
     expected = expected_pilot_devices()
 
     assert len(expected) == 20
@@ -144,6 +144,42 @@ def test_expected_devices_are_the_exact_twenty_case_sensitive_simulator_targets(
     assert service.validate_target_devices(valid) == tuple(
         sorted(valid, key=lambda device: str(device.id))
     )
+
+    unrelated = [
+        SimpleNamespace(id=UUID(int=101), name="NON-PILOT-CNC", device_type="CNC"),
+        SimpleNamespace(id=UUID(int=102), name="测试设备", device_type="default"),
+    ]
+    assert service.validate_target_devices([*valid, *unrelated]) == tuple(
+        sorted(valid, key=lambda device: str(device.id))
+    )
+
+    with pytest.raises(TenantBindingError, match="PILOT_DEVICE_SET_INVALID"):
+        service.validate_target_devices([*valid[:-1], unrelated[0]])
+
+    duplicate = [*valid, replace_device(valid[0], device_type=valid[0].device_type)]
+    duplicate[-1] = SimpleNamespace(
+        id=UUID(int=103),
+        name=duplicate[-1].name,
+        device_type=duplicate[-1].device_type,
+    )
+    with pytest.raises(TenantBindingError, match="PILOT_DEVICE_SET_INVALID"):
+        service.validate_target_devices(duplicate)
+
+    duplicate_target_id = [*valid]
+    duplicate_target_id[1] = SimpleNamespace(
+        id=duplicate_target_id[0].id,
+        name=duplicate_target_id[1].name,
+        device_type=duplicate_target_id[1].device_type,
+    )
+    with pytest.raises(TenantBindingError, match="PILOT_DEVICE_SET_INVALID"):
+        service.validate_target_devices(duplicate_target_id)
+
+    unrelated_reused_id = [
+        *valid,
+        SimpleNamespace(id=valid[0].id, name="NON-PILOT-CNC", device_type="CNC"),
+    ]
+    with pytest.raises(TenantBindingError, match="PILOT_DEVICE_SET_INVALID"):
+        service.validate_target_devices(unrelated_reused_id)
 
     display_label = [*valid]
     display_label[0] = replace_device(display_label[0], device_type="Injection molding")

@@ -44,6 +44,8 @@ platform-integration closed-loop-acceptance-verify --tenant-alias ALIAS \
 - `discover-identities` 只读发现 ThingsBoard 租户 ID 和 CMMS 公司 ID。
 - `provision-plan`、`provision-apply` 和 `provision-verify` 提供计划、精确确认执行及
   持久回执流程；所有外部写入都通过稳定 API。
+- Provision 只选择固定名称和类型的 20 台试点设备；同一 ThingsBoard 租户中的其他设备
+  不进入计划或写入目标。试点设备缺失、重名、类型或 UUID 漂移仍会在写入前拒绝。
 - `scheduler` 创建预测时隙，`prediction-worker` 领取并完成合资格运行，
 `shadow-summary` 只读输出有界验收证据。
 

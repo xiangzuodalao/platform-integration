@@ -247,6 +247,43 @@ async def test_invalid_device_type_or_set_fails_before_any_local_or_external_wri
 
 
 @pytest.mark.asyncio
+async def test_non_pilot_devices_are_preserved_outside_plan_and_apply() -> None:
+    """Unrelated tenant devices must neither block nor enter the fixed pilot allowlist."""
+    planned_extra = ThingsBoardDevice(id=UUID(int=101), name="NON-PILOT-CNC", device_type="CNC")
+    applied_extra = ThingsBoardDevice(id=UUID(int=102), name="测试设备", device_type="default")
+    provisioning, tb, cmms, _ = service(tb=FakeThingsBoard([*devices(), planned_extra]))
+
+    plan = await provisioning.build_plan(ISOLATED_TENANT_ID, ACTOR)
+    tb.devices = [*devices(), applied_extra]
+    result = await provisioning.apply(plan.plan_hash, plan.plan_hash, APPLY_ACTOR)
+
+    target_ids = {target.tb_device_id for target in result.targets}
+    assert len(target_ids) == 20
+    assert {target.device_name for target in result.targets} == set(expected_pilot_devices())
+    assert target_ids.isdisjoint({planned_extra.id, applied_extra.id})
+    assert {device_id for device_id, _, _ in tb.write_calls} == target_ids
+    assert len(cmms.create_calls) == 20
+
+
+@pytest.mark.asyncio
+async def test_apply_rejects_pilot_device_identity_drift_before_writes() -> None:
+    """Ignoring unrelated devices must not weaken the frozen pilot UUID identity."""
+    provisioning, tb, cmms, store = service()
+    plan = await provisioning.build_plan(ISOLATED_TENANT_ID, ACTOR)
+    original = tb.devices[0]
+    tb.devices[0] = ThingsBoardDevice(
+        id=UUID(int=999), name=original.name, device_type=original.device_type
+    )
+
+    with pytest.raises(ProvisioningError, match="PROVISIONING_TARGET_DRIFTED"):
+        await provisioning.apply(plan.plan_hash, plan.plan_hash, APPLY_ACTOR)
+
+    assert not any(event[0] == "start_apply" for event in store.events)
+    assert tb.write_calls == []
+    assert cmms.create_calls == []
+
+
+@pytest.mark.asyncio
 async def test_apply_rejects_absent_mismatch_expired_or_applied_plan_without_writes() -> None:
     """Weak confirmation gates could partially apply an unconfirmed or stale plan."""
     provisioning, tb, cmms, store = service()

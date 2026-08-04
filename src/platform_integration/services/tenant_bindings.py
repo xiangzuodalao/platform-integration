@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
@@ -94,11 +95,18 @@ class TenantBindingsService:
 
     def validate_target_devices(self, devices: Sequence[TargetDevice]) -> tuple[TargetDevice, ...]:
         expected = expected_pilot_devices()
-        actual = {device.name: device.device_type for device in devices}
-        unique_ids = {device.id for device in devices}
-        if len(devices) != 20 or len(unique_ids) != 20 or actual != expected:
+        targets = tuple(device for device in devices if device.name in expected)
+        target_names = Counter(device.name for device in targets)
+        target_ids = {device.id for device in targets}
+        all_id_counts = Counter(device.id for device in devices)
+        if (
+            target_names != Counter(expected.keys())
+            or any(device.device_type != expected[device.name] for device in targets)
+            or len(target_ids) != 20
+            or any(all_id_counts[device_id] != 1 for device_id in target_ids)
+        ):
             raise TenantBindingError("PILOT_DEVICE_SET_INVALID")
-        return tuple(sorted(devices, key=lambda device: str(device.id)))
+        return tuple(sorted(targets, key=lambda device: str(device.id)))
 
     async def validate_readiness(self, target_device_ids: Sequence[UUID]) -> ValidatedTenantBinding:
         if len(target_device_ids) != 20 or len(set(target_device_ids)) != 20:
