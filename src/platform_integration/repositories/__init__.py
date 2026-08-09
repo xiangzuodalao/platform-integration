@@ -1,0 +1,1 @@
+"""Transaction-scoped persistence repositories."""
