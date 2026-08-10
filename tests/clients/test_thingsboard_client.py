@@ -403,6 +403,57 @@ async def test_historical_telemetry_uses_the_exact_half_open_bucket_query() -> N
 
 
 @pytest.mark.asyncio
+async def test_historical_telemetry_accepts_empty_provider_object_as_no_rows() -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://tb.invalid",
+    ) as http:
+        client = ThingsBoardClient(
+            http=http,
+            credentials=provider(),
+            tb_credential_ref="TB_TEST_CREDENTIAL",
+        )
+        points = await client.historical_telemetry(
+            DEVICE_ID,
+            telemetry_key="vibration",
+            unit="mm/s",
+            start_ms=1785283740000,
+            end_exclusive_ms=1785287700000,
+        )
+
+    assert points == ()
+
+
+@pytest.mark.asyncio
+async def test_historical_telemetry_still_rejects_wrong_provider_key() -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"temperature": []})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://tb.invalid",
+    ) as http:
+        client = ThingsBoardClient(
+            http=http,
+            credentials=provider(),
+            tb_credential_ref="TB_TEST_CREDENTIAL",
+        )
+        with pytest.raises(ThingsBoardClientError) as exc_info:
+            await client.historical_telemetry(
+                DEVICE_ID,
+                telemetry_key="vibration",
+                unit="mm/s",
+                start_ms=1785283740000,
+                end_exclusive_ms=1785287700000,
+            )
+
+    assert exc_info.value.code == "THINGSBOARD_INVALID_TELEMETRY_RESPONSE"
+
+
+@pytest.mark.asyncio
 async def test_attribute_timeout_is_unknown_and_wrong_kind_fails_before_io() -> None:
     """Blindly hiding an unknown write or accepting another credential kind risks duplication."""
     calls = 0
