@@ -421,7 +421,11 @@ class ThingsBoardClient:
         )
         try:
             payload = response.json()
-            if type(payload) is not dict or set(payload) != {telemetry_key}:
+            if type(payload) is not dict:
+                raise ValueError("exact telemetry response required")
+            if not payload:
+                return ()
+            if set(payload) != {telemetry_key}:
                 raise ValueError("exact telemetry response required")
             rows = payload[telemetry_key]
             if type(rows) is not list:
