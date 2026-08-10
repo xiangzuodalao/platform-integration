@@ -13,7 +13,7 @@ from platform_integration.credentials import (
     CredentialResolutionError,
     EnvironmentCredentialProvider,
 )
-from platform_integration.services.data_quality import TelemetryPoint
+from platform_integration.services.data_quality import INTERVAL_MS, TelemetryPoint
 
 
 THINGSBOARD_TIMEOUT_SECONDS = 10.0
@@ -414,7 +414,7 @@ class ThingsBoardClient:
                 "keys": telemetry_key,
                 "startTs": start_ms,
                 "endTs": end_exclusive_ms - 1,
-                "interval": 60000,
+                "interval": INTERVAL_MS,
                 "agg": "AVG",
                 "orderBy": "ASC",
             },
@@ -436,7 +436,13 @@ class ThingsBoardClient:
                     raise ValueError("strict telemetry row required")
                 if type(row["ts"]) is not int or type(row["value"]) is not str:
                     raise ValueError("strict telemetry scalar required")
-                points.append(TelemetryPoint(row["ts"], row["value"], unit))
+                provider_timestamp = row["ts"]
+                if not start_ms <= provider_timestamp < end_exclusive_ms:
+                    raise ValueError("telemetry timestamp outside requested window")
+                bucket_timestamp = (
+                    start_ms + ((provider_timestamp - start_ms) // INTERVAL_MS) * INTERVAL_MS
+                )
+                points.append(TelemetryPoint(bucket_timestamp, row["value"], unit))
             return tuple(points)
         except ValueError:
             raise ThingsBoardClientError("THINGSBOARD_INVALID_TELEMETRY_RESPONSE") from None

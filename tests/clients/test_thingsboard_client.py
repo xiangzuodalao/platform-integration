@@ -428,6 +428,76 @@ async def test_historical_telemetry_accepts_empty_provider_object_as_no_rows() -
 
 
 @pytest.mark.asyncio
+async def test_historical_telemetry_normalizes_aggregate_midpoints_to_bucket_starts() -> None:
+    start_ms = 1785283740000
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "vibration": [
+                    {"ts": start_ms + 30000, "value": "4.00"},
+                    {"ts": start_ms + 89999, "value": "4.10"},
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://tb.invalid",
+    ) as http:
+        client = ThingsBoardClient(
+            http=http,
+            credentials=provider(),
+            tb_credential_ref="TB_TEST_CREDENTIAL",
+        )
+        points = await client.historical_telemetry(
+            DEVICE_ID,
+            telemetry_key="vibration",
+            unit="mm/s",
+            start_ms=start_ms,
+            end_exclusive_ms=start_ms + 120000,
+        )
+
+    assert [(item.timestamp, item.value) for item in points] == [
+        (start_ms, "4.00"),
+        (start_ms + 60000, "4.10"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_historical_telemetry_rejects_timestamp_outside_requested_window() -> None:
+    start_ms = 1785283740000
+    end_exclusive_ms = start_ms + 60000
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"vibration": [{"ts": end_exclusive_ms, "value": "4.00"}]},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://tb.invalid",
+    ) as http:
+        client = ThingsBoardClient(
+            http=http,
+            credentials=provider(),
+            tb_credential_ref="TB_TEST_CREDENTIAL",
+        )
+        with pytest.raises(ThingsBoardClientError) as exc_info:
+            await client.historical_telemetry(
+                DEVICE_ID,
+                telemetry_key="vibration",
+                unit="mm/s",
+                start_ms=start_ms,
+                end_exclusive_ms=end_exclusive_ms,
+            )
+
+    assert exc_info.value.code == "THINGSBOARD_INVALID_TELEMETRY_RESPONSE"
+
+
+@pytest.mark.asyncio
 async def test_historical_telemetry_still_rejects_wrong_provider_key() -> None:
     async def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"temperature": []})
